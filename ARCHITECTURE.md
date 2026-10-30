@@ -174,8 +174,14 @@ Binaries:
   **orchestrator-scoped** JWT (`sub="bootstrap"`). When started by
   `herdr-auth-proxy wrap`, the token is sent to `wrap` over a pipe (never
   written to disk), and `wrap` sets it as `HERDR_AUTH_JWT` in the herdr process
-  environment. Herdr passes that environment to every shell it spawns, so
-  `herdr-auth token mint` works from any shell. The bootstrap token may mint
+  environment. If the proxy is already running, `wrap` re-adopts the token from
+  the running herdr server's environment and verifies it with the live proxy
+  (`auth.hello`); when no server is running it replaces the proxy (safe — no
+  token depends on the old key) to get a fresh bootstrap token. A running
+  server without a usable token cannot be repaired from outside, so `wrap`
+  fails closed and asks for a server restart. Herdr passes that environment to
+  every shell it spawns, so `herdr-auth token mint` works from any shell. The
+  bootstrap token may mint
   **agent or orchestrator** tokens but never admin; an orchestrator token
   requires `cwd` and `workspace_id`. The bootstrap token is a bearer token, not
   the signing key: it cannot forge tokens and dies with the proxy. Bootstrap is
@@ -521,7 +527,10 @@ wrapper cannot intercept the daemon (the daemon command is built from
 `current_exe`, i.e. the real binary). Design:
 
 - `herdr-auth-proxy wrap -- herdr "$@"` (or an equivalent `herdr` wrapper script)
-  ensures the proxy is running for the resolved socket, then `exec`s herdr.
+  ensures the proxy is running for the resolved socket, resolves a valid
+  bootstrap token for this herdr session (fresh from the proxy, re-adopted from
+  the running server, or after replacing a stale proxy), then `exec`s herdr with
+  `HERDR_AUTH_JWT` set.
 - The proxy **daemonizes** (`setsid`, own log + pidfile/lockfile; idempotent), so
   the wrapper can exit with the client while the proxy keeps serving.
 - The proxy waits for `herdr.sock` to appear, serves, and **exits by itself** once
@@ -590,8 +599,12 @@ Decided in review:
 - **Grants**: defined set; default `["report_status"]`; `read_own_pane` opt-in.
 - **Bootstrap**: `herdr-auth-proxy wrap` receives the process-scoped,
   orchestrator-scoped bootstrap token from the proxy over a pipe and sets it as
-  `HERDR_AUTH_JWT` on the herdr process; all herdr shells inherit it. No file is
-  written. `herdr-auth token mint` uses that environment token to mint agent or
+  `HERDR_AUTH_JWT` on the herdr process; all herdr shells inherit it. If the
+  proxy is already running, `wrap` re-adopts the token from the running herdr
+  server (verified with `auth.hello`) or replaces the proxy when no server is
+  running; a running server without a usable token is an explicit error (its
+  environment cannot be changed externally). No file is written. `herdr-auth
+  token mint` uses that environment token to mint agent or
   orchestrator tokens (an orchestrator token requires both `cwd` and
   `workspace_id`), but **cannot mint admin**.
   The signing key stays in memory, so a proxy restart invalidates all tokens. The
