@@ -1,0 +1,153 @@
+# TODO
+
+Phased plan for herdr-auth-proxy. Design rationale, herdr-protocol findings and
+decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
+§2 = everything already investigated & verified against herdr 0.9.5).
+
+## Investigated so far (summary)
+
+- herdr repo found & cloned: `github.com/herdrdev/herdr` @ 0.9.5, API protocol 22.
+- Protocol fully mapped: JSON API socket (NDJSON, one request/connection,
+  streaming exceptions), 103 methods, no auth anywhere, `0600` perms only.
+- **No reusable client lib** (single binary crate, unpublished) — but full JSON
+  schema available (`herdr api schema --json`, `docs/next/api/herdr-api.schema.json`)
+  and the client is ~100 lines to re-implement.
+- Env precedence verified: pane env **cannot** override `HERDR_SOCKET_PATH`
+  (herdr-managed vars win) → client-side wrapper required (the deployment's
+  sandbox wrapper re-points it); `HERDR_AUTH_JWT` passes
+  through → JWT rides in pane env, proxy reads it from peer's `/proc/<pid>/environ`.
+- Pane metadata tokens **cannot** carry a JWT (80-char value limit).
+- opencode integration plugin verified: only `pane.report_agent` /
+  `pane.report_agent_session`, fresh connection per call, gated on pane env.
+- Bypass analysis: `pane.split`/`tab.create` spawn plain shells (children inherit
+  the real socket path) → allowed only with the proxy as env authority; the
+  sandbox is the deployment's **bwrap** wrapper (same uid → no uid-based trust);
+  `layout.apply` stays denied (explicit argv bypass).
+
+## Phase 0 — scaffold
+
+- [x] Add `justfile` (build, test, clippy, fmt) + rust-toolchain pin (nightly via flake)
+- [x] Add `LICENSE` file (Apache-2.0, decided)
+- [ ] CI: fmt + clippy + test; optional job that bumps herdr and re-runs deny tests
+
+## Phase 1 — keys & config
+
+- [x] Ed25519 keypair generation on first run in config dir (private key 0600,
+      never overwrite existing)
+- [x] `config.toml` loading (upstream/auth socket, agent TTL, death grace)
+- [x] JWT claim types (sub, role, pane_id, grants, perm) + sign/verify
+
+## Phase 2 — proxy core
+
+- [x] Auth socket listener; accept loop; SO_PEERCRED pid capture (uid is **not**
+      used for auth — bwrap keeps the herdr uid)
+- [x] NDJSON codec (1 MiB cap, 5s initial timeout — mirror herdr limits)
+- [x] One pinned upstream connection per downstream connection; passthrough for
+      request/response
+- [x] Upstream health ping + watchdog (self-exit after `death_grace_s`)
+
+## Phase 3 — auth
+
+- [x] `auth.hello` wire mode (first line, EdDSA verify, exp/nbf)
+- [x] Peer-environ extraction mode (`/proc/<pid>/environ` → `HERDR_AUTH_JWT`,
+      cross-check `HERDR_PANE_ID` vs claim)
+- [x] Fail-closed unauth error (`unauthorized`, close); `auth.whoami`
+- [x] Audit log (deny decisions with method/sub/role)
+
+## Phase 4 — policy engine
+
+- [x] Method registry (103 herdr methods, protocol 22) embedded
+- [x] Explicit role allowlists (default-deny; no danger-class wildcards)
+- [x] Param guards: agent `pane_id` forcing; `agent.start` kind whitelist
+      (args passed through); `layout.apply` denied; **env authority** for
+      `pane.split`/`tab.create` (proxy injects JWT)
+- [x] Owned-only visibility: filter `pane.list`/`agent.list`/`tab.list`
+- [x] Default-deny for unknown methods + `[new-command]` WARN logging
+- [ ] Compare upstream `ping.protocol` with the embedded registry and warn
+
+## Phase 5 — personas
+
+- [x] `agent` preset (report-only, pane-bound) — verified against a fake
+      upstream; still to prove with the real opencode integration plugin
+- [x] `orchestrator` preset: **minimal explicit allowlist, default-deny**
+      (owned-only reads + own-pane ops + `agent.start` kind `[opencode]` + args
+      to the wrapper + `pane.split`/`tab.create` + `auth.agent.spawn` +
+      `auth.token.mint`); nothing else
+- [x] `admin` preset + local bootstrap `mint` subcommand
+- [x] Document & validate the **bwrap wrapper contract** (§ ARCHITECTURE 4.3):
+      hides herdr's real socket, `HERDR_SOCKET_PATH` → `auth.sock`,
+      `HERDR_AUTH_JWT` passthrough, validates agent args, no fallback
+
+## Phase 6 — minting
+
+- [x] `auth.token.mint`: minter scope check, permission-subset intersection,
+      `exp` clamped to minter `exp` (infinite minter → default 24 h), child
+      `owner` claim, `jti` uniqueness
+- [x] `auth.agent.spawn` (atomic): `tab.create` → bind pending `jti` to
+      `root_pane.pane_id` → `agent.start` (kind whitelist; args passed to the
+      wrapper); on failure close the tab + revoke the token
+- [x] Grant subset enforcement: requested `grants` ∩ global grantable set ∩
+      minter's `agent_grants`; default `["report_status"]`; over-request →
+      `grant_not_allowed`
+
+## Phase 7 — pane ownership
+
+- [x] Record pane/tab/workspace ids from creation responses (`pane.split`,
+      `tab.create`, ...) per sub
+- [x] Persist ownership across restarts (`state.json`); prune expired tokens
+- [x] Enforce on all pane-tab-targeting methods; owned-only list filtering
+- [ ] Optional metadata mirror (`auth_owner`, `auth_jti` via
+      `pane.report_metadata`)
+
+## Phase 8 — client helper (deferred)
+
+- [x] Decided: v1 ships **no** client-side helper; rely on the deployment's
+      sandbox wrapper (contract documented in Phase 5 / ARCHITECTURE §4.3)
+- [ ] `herdr-auth-launch` moved to "Later / optional" below
+
+## Phase 9 — lifecycle & packaging
+
+- [x] `herdr-auth-proxy wrap -- herdr "$@"`: resolve the herdr socket like herdr,
+      ensure the proxy is running (idempotent), then exec herdr
+- [x] Proxy daemonizing: `setsid`, log + pidfile, detached from the client
+- [x] Self-exit when the upstream has been unreachable for `death_grace_s`;
+      `stop`/`status` subcommands
+- [x] `herdr-auth` client CLI: `call <method> --json`, `agent spawn`,
+      `token mint`, `whoami`, `methods`; JWT via `--token`/`--token-file`/
+      `$HERDR_AUTH_JWT` (auth.hello first line) or env fallback
+- [x] Grantable-capability validation in the CLI (`--grant`, 4 capabilities)
+- [x] Nix packaging: `packages.default` (both binaries), `apps`, `overlays`,
+      `nixosModules.default`, `homeManagerModules.default`, `formatter`;
+      verified with `nix build .#`
+- [ ] README quick-start: install → bootstrap admin token → mint orchestrator →
+      spawn gated opencode agent
+
+## Phase 10 — hardening & tests
+
+- [x] Unit tests: JWT roundtrip/tamper/expiry, grants, policy allowlists,
+      ownership/state, environ parsing (22 tests)
+- [x] Fake-upstream smoke test: hello + environ auth, admin/orchestrator/agent
+      personas, owned-only list, pane forcing, atomic spawn, wrap/stop/status
+- [ ] Integration test against a real herdr (nix-provided) covering both personas
+- [ ] Bypass tests: raw-input methods denied; unknown method denied+logged;
+      expired/pane-mismatched tokens rejected; environ without JWT rejected;
+      non-whitelisted `agent.start` kind denied; owned-only list filtering;
+      bwrap wrapper cannot reach the real socket
+- [ ] Streaming tests (`agent.wait`, `agent.prompt --wait`) hold the upstream
+      connection until the response
+- [ ] `auth.agent.spawn` atomicity tests: failure → tab closed + `jti` revoked;
+      grant over-request rejected
+- [ ] Fuzz NDJSON framing; slow-client behavior
+
+## Later / optional
+
+- [ ] `herdr-auth-launch` client helper: exec mode (re-point
+      `HERDR_SOCKET_PATH`, keep `HERDR_AUTH_JWT`/`HERDR_PANE_ID`, optional uid
+      drop) + relay mode (per-client socket + `auth.hello` stamping) — for
+      deployments without a sandbox wrapper / unreadable `/proc`
+- [ ] Event-stream filtering by ownership
+- [ ] Admin minting via a separate control socket (v1: local CLI + key
+      possession)
+- [ ] Client-socket (binary render protocol) proxying — needs bincode codec,
+      frozen enum tags, PROTOCOL_VERSION pinning; explicitly v2
+- [ ] Multi-session upstreams; revocation list
