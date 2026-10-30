@@ -82,8 +82,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
       (owned-only reads + own-pane ops + **only** `auth.agent.spawn` for
       creation/start + `auth.token.mint`); direct `pane.split`/`tab.create`/
       `agent.start` denied; nothing else
-- [x] Bootstrap `mint` subcommand mints agent or orchestrator tokens; bootstrap
-      cannot mint admin; `admin` role remains reserved
+- [x] Bootstrap `herdr-auth token mint` mints agent or orchestrator tokens;
+      bootstrap cannot mint admin; `admin` role remains reserved
 - [x] Document & validate the **bwrap wrapper contract** (§ ARCHITECTURE 4.3):
       hides herdr's real socket, `HERDR_SOCKET_PATH` → `auth.sock`,
       `HERDR_AUTH_JWT` passthrough, validates agent args, no fallback
@@ -156,8 +156,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
       drop) + relay mode (per-client socket + `auth.hello` stamping) — for
       deployments without a sandbox wrapper / unreadable `/proc`
 - [ ] Event-stream filtering by ownership
-- [ ] Admin minting via a separate control socket (v1: local CLI + key
-      possession)
+- [ ] Admin minting via a separate control socket (v1: no admin token is issued
+      by the bootstrap)
 - [ ] Client-socket (binary render protocol) proxying — needs bincode codec,
       frozen enum tags, PROTOCOL_VERSION pinning; explicitly v2
 - [ ] Multi-session upstreams; revocation list
