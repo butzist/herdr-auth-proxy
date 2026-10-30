@@ -97,8 +97,9 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
       `root_pane.pane_id` → `agent.start` (kind whitelist; args passed to the
       wrapper); on failure close the tab + revoke the token
 - [x] Grant subset enforcement: requested `grants` ∩ global grantable set ∩
-      minter's `agent_grants`; default `["report_status"]`; over-request →
-      `grant_not_allowed`
+      minter's `agent_grants`; the orchestrator ceiling defaults to the full
+      advertised set, agent tokens default to `["report_status"]`; over-request
+      → `grant_not_allowed`
 
 ## Phase 7 — pane ownership
 
@@ -139,7 +140,11 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 ## Phase 10 — hardening & tests
 
 - [x] Unit tests: JWT roundtrip/tamper/expiry, grants, policy allowlists,
-      ownership/state, environ parsing (22 tests)
+      ownership/state, environ parsing
+- [x] Live-testing hardening: `max_token_ttl_s` hard cap for requested TTLs;
+      reject `perm` on agent tokens and `grants` on non-agent tokens; agent
+      reports reject foreign panes, pin `agent`/`source`, and reject
+      `resume_argv`; CLI flags override inherited `HERDR_AUTH_JWT`
 - [x] Fake-upstream smoke test: hello + environ auth, admin/orchestrator/agent
       personas, owned-only list, pane forcing, atomic spawn, wrap/stop/status
 - [ ] Integration test against a real herdr (nix-provided) covering both personas

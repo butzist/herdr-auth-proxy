@@ -289,6 +289,105 @@ async fn identity_from_claims(ctx: &Ctx, claims: Claims) -> Identity {
     }
 }
 
+/// Agent tokens are pinned to one pane and one reporting identity.
+///
+/// A supplied pane that differs from the claim is rejected instead of being
+/// silently rewritten, so a caller cannot believe it wrote to another pane.
+/// Reporting is fixed to the only sandboxed agent kind: an agent cannot relabel
+/// its pane as another agent, and it cannot inject `resume_argv` (herdr executes
+/// that command on restore as the herdr user).
+fn enforce_agent_params(
+    identity: &Identity,
+    method: &str,
+    params: &mut Value,
+) -> Result<(), (String, String)> {
+    let Some(pane) = identity.pane_id.as_deref() else {
+        return Err((
+            "forbidden".to_string(),
+            "agent token is not bound to a pane".to_string(),
+        ));
+    };
+
+    if matches!(
+        method,
+        "pane.report_agent"
+            | "pane.report_agent_session"
+            | "pane.report_metadata"
+            | "pane.get"
+            | "pane.read"
+            | "pane.wait_for_output"
+    ) {
+        if let Some(requested) = policy::pane_id_param(params)
+            && requested != pane
+        {
+            return Err((
+                "forbidden".to_string(),
+                "pane is fixed by the token".to_string(),
+            ));
+        }
+        if let Some(object) = params.as_object_mut() {
+            object.remove("target_pane_id");
+        }
+        params["pane_id"] = json!(pane);
+    }
+
+    if method == "agent.get" {
+        if let Some(requested) = policy::agent_target_pane(params)
+            && requested != pane
+        {
+            return Err((
+                "forbidden".to_string(),
+                "agent pane is fixed by the token".to_string(),
+            ));
+        }
+        params["target"] = json!(pane);
+    }
+
+    if matches!(
+        method,
+        "pane.report_agent" | "pane.report_agent_session" | "pane.report_metadata"
+    ) {
+        enforce_agent_reporting_identity(params)?;
+    }
+
+    Ok(())
+}
+
+/// Fix the reported agent/source to the only allowed sandboxed kind and reject
+/// herdr's resume-command field.
+fn enforce_agent_reporting_identity(params: &mut Value) -> Result<(), (String, String)> {
+    if params
+        .get("resume_argv")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err((
+            "forbidden".to_string(),
+            "resume_argv is not allowed for agent tokens".to_string(),
+        ));
+    }
+    let agent = policy::SANDBOXED_AGENT_KINDS[0];
+    let source = format!("herdr:{agent}");
+    if let Some(requested) = params.get("agent").and_then(Value::as_str)
+        && requested != agent
+    {
+        return Err((
+            "forbidden".to_string(),
+            "agent identity is fixed by the token".to_string(),
+        ));
+    }
+    if let Some(requested) = params.get("source").and_then(Value::as_str)
+        && requested != source
+    {
+        return Err((
+            "forbidden".to_string(),
+            "report source is fixed by the token".to_string(),
+        ));
+    }
+    params["agent"] = json!(agent);
+    params["source"] = json!(source);
+    Ok(())
+}
+
 async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> String {
     let id = protocol::id_of(request);
     let method = protocol::method_of(request).to_string();
@@ -347,24 +446,10 @@ async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> Strin
         return protocol::error(&id, "forbidden", "method not allowed for this role");
     }
 
-    if identity.role == Role::Agent {
-        let Some(pane) = identity.pane_id.as_deref() else {
-            return protocol::error(&id, "forbidden", "agent token is not bound to a pane");
-        };
-        if matches!(
-            method.as_str(),
-            "pane.report_agent"
-                | "pane.report_agent_session"
-                | "pane.report_metadata"
-                | "pane.get"
-                | "pane.read"
-                | "pane.wait_for_output"
-        ) {
-            params["pane_id"] = json!(pane);
-        }
-        if method == "agent.get" {
-            params["target"] = json!(pane);
-        }
+    if identity.role == Role::Agent
+        && let Err((code, message)) = enforce_agent_params(identity, &method, &mut params)
+    {
+        return protocol::error(&id, &code, &message);
     }
 
     if identity.role != Role::Admin {
@@ -470,7 +555,7 @@ async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> Strin
         let jti = jwt::random_id();
         let now = jwt::now();
         let exp = clamp_exp(
-            Some(now + ctx.cfg.agent_ttl_s),
+            Some(now.saturating_add(ctx.cfg.agent_ttl_s.min(ctx.cfg.max_token_ttl_s))),
             identity.exp,
             identity.perm.as_ref().and_then(|perm| perm.mint_max_ttl_s),
             now,
@@ -691,7 +776,8 @@ fn clamp_exp(exp: Option<u64>, parent: Option<u64>, max_ttl: Option<u64>, now: u
         exp = Some(exp.map_or(parent, |exp| exp.min(parent)));
     }
     if let Some(max_ttl) = max_ttl {
-        exp = Some(exp.map_or(now + max_ttl, |exp| exp.min(now + max_ttl)));
+        let cap = now.saturating_add(max_ttl);
+        exp = Some(exp.map_or(cap, |exp| exp.min(cap)));
     }
     exp
 }
@@ -713,6 +799,12 @@ async fn mint(
     };
     let grants = string_array(params, "grants");
     grants::validate(&grants).map_err(|error| ("invalid_grant".to_string(), error))?;
+    if role != Role::Agent && !grants.is_empty() {
+        return Err((
+            "invalid_param".into(),
+            "grants are only valid for agent tokens".into(),
+        ));
+    }
     let requested_ttl = params.get("ttl_s").and_then(Value::as_u64);
     let pane_id = params
         .get("pane_id")
@@ -744,6 +836,12 @@ async fn mint(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| ("invalid_param".to_string(), format!("perm: {error}")))?;
+    if role == Role::Agent && perm.is_some() {
+        return Err((
+            "invalid_param".into(),
+            "perm is only valid for orchestrator tokens".into(),
+        ));
+    }
     if let Some(perm) = &perm
         && perm
             .agent_kinds
@@ -783,7 +881,7 @@ async fn mint(
                 .as_ref()
                 .map(|perm| perm.agent_grants.clone())
                 .filter(|grants| !grants.is_empty())
-                .unwrap_or_else(|| vec!["report_status".to_string()]);
+                .unwrap_or_else(grants::default_orchestrator_grants);
             if !grants::is_subset(&grants, &allowed) {
                 return Err((
                     "grant_not_allowed".into(),
@@ -886,9 +984,12 @@ async fn mint(
     };
 
     let now = jwt::now();
+    let max_ttl = ctx.cfg.max_token_ttl_s;
     let exp = requested_ttl
-        .map(|ttl| now + ttl)
-        .or_else(|| (role == Role::Agent).then_some(now + ctx.cfg.agent_ttl_s));
+        .map(|ttl| now.saturating_add(ttl.min(max_ttl)))
+        .or_else(|| {
+            (role == Role::Agent).then(|| now.saturating_add(ctx.cfg.agent_ttl_s.min(max_ttl)))
+        });
     let exp = clamp_exp(
         exp,
         identity.exp,
@@ -955,6 +1056,12 @@ async fn spawn(
 ) -> Result<Value, (String, String)> {
     if identity.role == Role::Agent {
         return Err(("forbidden".into(), "agents cannot spawn agents".into()));
+    }
+    if params.get("perm").is_some() {
+        return Err((
+            "invalid_param".into(),
+            "perm is not valid for agent tokens".into(),
+        ));
     }
     let kind = params
         .get("kind")
@@ -1057,7 +1164,7 @@ async fn spawn(
             .as_ref()
             .map(|perm| perm.agent_grants.clone())
             .filter(|grants| !grants.is_empty())
-            .unwrap_or_else(|| vec!["report_status".to_string()]);
+            .unwrap_or_else(grants::default_orchestrator_grants);
         if !grants::is_subset(&requested, &allowed) {
             return Err((
                 "grant_not_allowed".into(),
@@ -1070,9 +1177,10 @@ async fn spawn(
     let ttl = params
         .get("ttl_s")
         .and_then(Value::as_u64)
-        .unwrap_or(ctx.cfg.agent_ttl_s);
+        .unwrap_or(ctx.cfg.agent_ttl_s)
+        .min(ctx.cfg.max_token_ttl_s);
     let exp = clamp_exp(
-        Some(now + ttl),
+        Some(now.saturating_add(ttl)),
         identity.exp,
         identity.perm.as_ref().and_then(|perm| perm.mint_max_ttl_s),
         now,
@@ -1221,6 +1329,55 @@ mod tests {
         cwd::canonical(path.to_str().unwrap()).unwrap()
     }
 
+    fn test_ctx() -> Arc<Ctx> {
+        let dir = std::env::temp_dir().join(format!("hap-server-{}", jwt::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+            auth_socket: dir.join("auth.sock"),
+            upstream_socket: dir.join("herdr.sock"),
+            state_file: dir.join("state.json"),
+            pid_file: dir.join("proxy.pid"),
+            log_file: dir.join("proxy.log"),
+        };
+        Arc::new(Ctx {
+            cfg: config::Config::default(),
+            paths,
+            keys: keys::Keys::from_secret([9u8; 32]),
+            state: Mutex::new(State::default()),
+            bootstrap_jti: "bootstrap-jti".into(),
+        })
+    }
+
+    fn bootstrap_identity() -> Identity {
+        Identity {
+            sub: "bootstrap".into(),
+            role: Role::Orchestrator,
+            grants: Vec::new(),
+            perm: None,
+            pane_id: None,
+            cwd: None,
+            workspace_id: None,
+            jti: "bootstrap-jti".into(),
+            exp: None,
+        }
+    }
+
+    fn agent_identity(pane: &str) -> Identity {
+        Identity {
+            sub: "orch:agent".into(),
+            role: Role::Agent,
+            grants: vec!["report_status".into(), "report_metadata".into()],
+            perm: None,
+            pane_id: Some(pane.into()),
+            cwd: None,
+            workspace_id: None,
+            jti: "agent-jti".into(),
+            exp: None,
+        }
+    }
+
     #[test]
     fn token_cwd_overrides_caller_cwd() {
         let dir = temp_dir();
@@ -1250,5 +1407,151 @@ mod tests {
         let mut params = json!({});
         let (code, _) = enforce_cwd(&identity, &mut params).unwrap_err();
         assert_eq!(code, "missing_cwd");
+    }
+
+    #[tokio::test]
+    async fn mint_caps_requested_ttl() {
+        let ctx = test_ctx();
+        let identity = bootstrap_identity();
+        let before = jwt::now();
+        let result = mint(
+            &ctx,
+            &identity,
+            &json!({"role": "agent", "ttl_s": 999_999_999u64}),
+        )
+        .await
+        .unwrap();
+        let exp = result["exp"].as_u64().unwrap();
+        let expected = before.saturating_add(ctx.cfg.max_token_ttl_s);
+        assert!(
+            exp.abs_diff(expected) <= 2,
+            "exp {exp} not capped at {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_perm_for_agent_tokens() {
+        let ctx = test_ctx();
+        let identity = bootstrap_identity();
+        let (code, message) = mint(
+            &ctx,
+            &identity,
+            &json!({"role": "agent", "perm": {"read_own_pane": true}}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, "invalid_param");
+        assert!(message.contains("perm"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn mint_rejects_grants_for_non_agent_tokens() {
+        let ctx = test_ctx();
+        let identity = bootstrap_identity();
+        let (code, _) = mint(
+            &ctx,
+            &identity,
+            &json!({
+                "role": "orchestrator",
+                "grants": ["report_status"],
+                "cwd": "/tmp",
+                "workspace_id": "w1",
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, "invalid_param");
+    }
+
+    #[tokio::test]
+    async fn default_orchestrator_can_grant_every_advertised_capability() {
+        let ctx = test_ctx();
+        let identity = bootstrap_identity();
+        for grant in grants::GRANTABLE_AGENT_CAPABILITIES {
+            let result = mint(
+                &ctx,
+                &identity,
+                &json!({"role": "agent", "grants": [grant]}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["role"], json!("agent"));
+        }
+    }
+
+    #[test]
+    fn agent_foreign_pane_is_rejected() {
+        let identity = agent_identity("w1:p8");
+        let mut params = json!({"pane_id": "w1:p9"});
+        let (code, _) =
+            enforce_agent_params(&identity, "pane.report_agent", &mut params).unwrap_err();
+        assert_eq!(code, "forbidden");
+    }
+
+    #[test]
+    fn agent_pane_and_reporting_identity_are_forced() {
+        let identity = agent_identity("w1:p8");
+        let mut params = json!({"target_pane_id": "w1:p8"});
+        enforce_agent_params(&identity, "pane.report_agent", &mut params).unwrap();
+        assert_eq!(params["pane_id"], json!("w1:p8"));
+        assert!(params.get("target_pane_id").is_none());
+        assert_eq!(params["agent"], json!("opencode"));
+        assert_eq!(params["source"], json!("herdr:opencode"));
+    }
+
+    #[test]
+    fn agent_cannot_spoof_agent_identity() {
+        let identity = agent_identity("w1:p8");
+        let mut params = json!({"agent": "totally-bogus"});
+        let (code, _) =
+            enforce_agent_params(&identity, "pane.report_agent", &mut params).unwrap_err();
+        assert_eq!(code, "forbidden");
+    }
+
+    #[test]
+    fn agent_cannot_set_resume_argv() {
+        let identity = agent_identity("w1:p8");
+        let mut params = json!({"resume_argv": ["sh", "-c", "id"]});
+        let (code, _) =
+            enforce_agent_params(&identity, "pane.report_agent", &mut params).unwrap_err();
+        assert_eq!(code, "forbidden");
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_foreign_pane_before_forwarding() {
+        let ctx = test_ctx();
+        let identity = agent_identity("w1:p8");
+        let request = json!({
+            "id": "1",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": "w1:p9",
+                "agent": "opencode",
+                "source": "herdr:opencode",
+                "state": "idle",
+            },
+        });
+        let response: Value = serde_json::from_str(&dispatch(&ctx, &identity, &request).await)
+            .expect("valid response");
+        assert_eq!(response["error"]["code"], json!("forbidden"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_agent_identity_spoofing() {
+        let ctx = test_ctx();
+        let identity = agent_identity("w1:p8");
+        let request = json!({
+            "id": "1",
+            "method": "pane.report_agent",
+            "params": {
+                "pane_id": "w1:p8",
+                "agent": "totally-bogus",
+                "source": "herdr:opencode",
+                "state": "idle",
+            },
+        });
+        let response: Value = serde_json::from_str(&dispatch(&ctx, &identity, &request).await)
+            .expect("valid response");
+        assert_eq!(response["error"]["code"], json!("forbidden"));
     }
 }
