@@ -220,9 +220,11 @@ Binaries:
 - TTL: a child token's `exp` is always **clamped to the parent's `exp`** (a child
   never outlives its minter). When the minter is an infinite orchestrator token,
   the requested/default agent TTL applies (default 24 h, configurable), and the
-  token is re-minted if a pane is restored after a herdr restart. Child tokens are
-  always a **subset** of the minter's permissions (enforced by intersecting
-  `perm`/`grants` before signing).
+  token is re-minted if a pane is restored after a herdr restart. Every
+  requested TTL is also capped by the proxy-wide `max_token_ttl_s` (default
+  24 h), so `--ttl-s` can never request an arbitrarily long-lived token. Child
+  tokens are always a **subset** of the minter's permissions (enforced by
+  intersecting `perm`/`grants` before signing).
 
 ### 4.2 Connection association (two modes, both fail-closed)
 
@@ -337,13 +339,16 @@ call, with token binding and failure cleanup (§7.1). Direct `pane.split`,
 
 | Persona | Token | Allowed herdr methods (default) |
 |---|---|---|
-| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` **forced** to the claim); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output` (own pane). Default: `["report_status"]`. Exactly covers the opencode plugin. |
+| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` must equal the claim; `agent`/`source` pinned to `opencode`); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output` (own pane). Default: `["report_status"]`. Exactly covers the opencode plugin. |
 | **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including direct `pane.split`, `tab.create` and `agent.start` (they create/use plain shells), `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
 | **admin** (reserved) | role=admin | All methods + `auth.*`; not issued by the default bootstrap (the bootstrap token is orchestrator-scoped and cannot mint admin). |
 
 **Grantable agent capabilities.** An orchestrator may grant only a subset of
 this list *and* of its own `agent_grants` (a child never exceeds its parent).
-Default when omitted: `["report_status"]`. `ping` is always allowed.
+An orchestrator's ceiling defaults to the **full list** when its token has no
+`perm.agent_grants`, so every advertised capability is actually grantable; an
+explicit `perm.agent_grants` narrows it. Agent tokens default to
+`["report_status"]` when no `grants` are requested. `ping` is always allowed.
 
 | Grant | Unlocks (own pane only) |
 |---|---|
@@ -411,10 +416,14 @@ socket path — a full bypass.
 - Per-method **danger classes** (our own, not herdr's `changes_ui`):
   `readonly`, `ui`, `raw_input`, `spawn`, `lifecycle`, `admin`.
 - **Param guards**: pane-targeting methods check ownership (§9); agent-role
-  `pane_id` params are overwritten with the claim; `auth.agent.spawn` whitelists
-  the `kind` only (`["opencode"]`, the sandbox wrapper) and passes `args`
-  through — the wrapper validates them; direct `agent.start` is denied to
-  orchestrators; `layout.apply` is denied (explicit argv = bypass).
+  `pane_id`/`target` params must equal the claim (a foreign or nonexistent pane
+  is `forbidden`, never silently rewritten). Agent reporting is pinned to the
+  only sandboxed kind (`agent="opencode"`, `source="herdr:opencode"`) so an
+  agent cannot relabel its own pane; `resume_argv` is rejected because herdr
+  later executes it as the herdr user. `auth.agent.spawn` whitelists the `kind`
+  only (`["opencode"]`, the sandbox wrapper) and passes `args` through — the
+  wrapper validates them; direct `agent.start` is denied to orchestrators;
+  `layout.apply` is denied (explicit argv = bypass).
   **Env authority**: for every process-launching method the proxy builds the env
   — caller env is validated, not trusted: only `HERDR_AUTH_JWT` (proxy-injected)
   and caller-approved keys survive; `PATH`, `SHELL`, `ENV`, `BASH_ENV`,
@@ -455,7 +464,8 @@ NDJSON codec:
 | `auth.agent.spawn` | **atomic**: `tab.create` + mint/bind child token + `agent.start` (kind whitelist; args passed to the wrapper); closes the tab and revokes the token if any step fails |
 
 `auth.agent.spawn` params: `kind`, `args`, optional `name`, `label`, `focus`,
-`ttl_s`, `grants`, `perm`. The caller never supplies `env`; the proxy builds it
+`ttl_s`, `grants` (agent tokens never carry `perm`, so it is rejected). The
+caller never supplies `env`; the proxy builds it
 and injects the child token. The tab/root pane is always created in the caller
 token's `cwd` and `workspace_id`; supplied values are only accepted if they
 equal the claims. Requested `grants` are intersected with the global grantable
@@ -545,7 +555,8 @@ wrapper cannot intercept the daemon (the daemon command is built from
 # config.toml (flat; all optional)
 upstream_socket = "auto"       # or an explicit path; "auto" follows herdr
 auth_socket = "auto"           # $XDG_RUNTIME_DIR/herdr-auth-proxy/auth.sock
-agent_ttl_s = 86400
+agent_ttl_s = 86400            # default agent lifetime
+max_token_ttl_s = 86400        # hard cap for every requested TTL
 death_grace_s = 15
 ```
 
@@ -596,7 +607,9 @@ Decided in review:
   explicit argv that herdr executes directly as the herdr user with the real
   socket path (a full bypass). Pane creation and agent start are pinned to the
   token's `cwd` claim; callers cannot choose a different directory.
-- **Grants**: defined set; default `["report_status"]`; `read_own_pane` opt-in.
+- **Grants**: defined set; an orchestrator's grant ceiling defaults to the full
+  advertised set (narrow with `perm.agent_grants`); agent tokens default to
+  `["report_status"]`; `read_own_pane`/`wait_own_output` are explicit grants.
 - **Bootstrap**: `herdr-auth-proxy wrap` receives the process-scoped,
   orchestrator-scoped bootstrap token from the proxy over a pipe and sets it as
   `HERDR_AUTH_JWT` on the herdr process; all herdr shells inherit it. If the
@@ -611,16 +624,15 @@ Decided in review:
   proxy **cannot** verify that a client is the operator (uid is shared, bwrap
   keeps the herdr uid); the bootstrap token being confined to herdr's process
   environment and kept out of sandboxes is the check.
-- **Child token lifetime**: `exp ≤ minter exp`; with an infinite orchestrator the
-  default agent TTL applies (24 h), re-mint on restore.
+- **Child token lifetime**: `exp ≤ minter exp` and `≤ now + max_token_ttl_s`;
+  with an infinite orchestrator the default agent TTL applies (24 h), re-mint on
+  restore.
 - **herdr pinning**: CI regenerates the registry and runs the deny tests.
 - **License**: Apache-2.0.
 
 Remaining:
 
-1. **Default orchestrator `agent_grants`**: currently `["report_status"]` when
-   the token's `perm` is absent; `read_own_pane` must be requested explicitly.
-2. **Real-world validation**: integration test against a real herdr + the real
+1. **Real-world validation**: integration test against a real herdr + the real
    opencode plugin (current tests use a fake upstream).
-3. **Grace period**: default 15 s (`death_grace_s`), confirm against live
+2. **Grace period**: default 15 s (`death_grace_s`), confirm against live
    handoff timing.

@@ -16,6 +16,10 @@ pub struct Config {
     pub auth_socket: Option<String>,
     /// Default lifetime for agent tokens.
     pub agent_ttl_s: u64,
+    /// Hard cap for every explicitly requested token lifetime (seconds). A
+    /// token never expires later than `now + max_token_ttl_s` when a TTL is
+    /// requested, regardless of what the caller asks for.
+    pub max_token_ttl_s: u64,
     /// How long the upstream socket may be unreachable before the proxy exits.
     pub death_grace_s: u64,
 }
@@ -26,6 +30,7 @@ impl Default for Config {
             upstream_socket: None,
             auth_socket: None,
             agent_ttl_s: 86_400,
+            max_token_ttl_s: 86_400,
             death_grace_s: 15,
         }
     }
@@ -135,6 +140,7 @@ mod tests {
     fn defaults_are_sane() {
         let config = Config::default();
         assert_eq!(config.agent_ttl_s, 86_400);
+        assert_eq!(config.max_token_ttl_s, 86_400);
         assert_eq!(config.death_grace_s, 15);
     }
 }

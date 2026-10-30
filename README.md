@@ -118,9 +118,12 @@ Pane-bound agent tokens can only be minted for a pane the minter owns; the
 bootstrap token owns no panes. Use `auth.agent.spawn` (or an orchestrator token)
 to create/bind agent tokens.
 
-`mint` uses `HERDR_AUTH_JWT` from its environment. Because every shell inherits
-the bootstrap token, any command in a user shell can mint agent/orchestrator
-tokens; that is the trade-off of the env-based design. The herdr **server** must
+`mint` uses `HERDR_AUTH_JWT` from its environment unless `--token` or
+`--token-file` is given; explicit flags always win over the environment, so
+testing a minted agent token does not silently fall back to the inherited
+orchestrator token. Because every shell inherits the bootstrap token, any
+command in a user shell can mint agent/orchestrator tokens; that is the
+trade-off of the env-based design. The herdr **server** must
 be started through `wrap` (or restarted under it) so it inherits the token;
 `wrap` reuses the running server's token when possible and errors when the
 server has none (a running server's environment cannot be changed from outside).
@@ -165,11 +168,15 @@ Additional rules:
   `minter:jti[:label]`; a caller cannot choose a bare `sub` or impersonate
   another owner.
 - `perm.agent_grants` is intersected with the global grantable set and the
-  minter's grants. `perm.agent_kinds` can only narrow the global sandboxed kind
-  list (`opencode`); it cannot widen it. `perm.mint_max_ttl_s` caps child TTL.
-  `mint_roles` no longer exists.
-- Child `exp` is clamped to the minter's `exp` and its `mint_max_ttl_s`. Agent
-  tokens default to 24 h; orchestrator tokens have no default expiry unless
+  minter's grants. An orchestrator whose token has no `perm.agent_grants` may
+  grant any advertised capability; set `perm.agent_grants` to narrow that
+  ceiling. `perm.agent_kinds` can only narrow the global sandboxed kind list
+  (`opencode`); it cannot widen it. `perm.mint_max_ttl_s` caps child TTL.
+  `perm` is only valid for orchestrator tokens; `grants` are only valid for
+  agent tokens. `mint_roles` no longer exists.
+- Child `exp` is clamped to the minter's `exp`, its `mint_max_ttl_s`, and the
+  proxy-wide `max_token_ttl_s` (default 24 h). Agent tokens default to
+  `agent_ttl_s` (24 h); orchestrator tokens have no default expiry unless
   `--ttl_s` is supplied.
 - `herdr-auth token mint` defaults to `--role agent`; pass `--role orchestrator`
   for the initial bootstrap token. `herdr-auth-proxy` has no mint subcommand.
@@ -204,6 +211,12 @@ herdr-auth-proxy stop
 
 Grantable agent capabilities: `report_status`, `report_metadata`,
 `read_own_pane`, `wait_own_output` (see ARCHITECTURE §5).
+
+An agent token is pinned to its pane and to the `opencode` reporting identity:
+a report for another pane is rejected, and `agent`/`source` cannot be changed.
+`pane.report_agent` accepts `idle | working | blocked | unknown`; `done` is
+derived by herdr's tool integration and is rejected by herdr itself.
+`resume_argv` is rejected for agent tokens (herdr would execute it on restore).
 
 ## Topology
 

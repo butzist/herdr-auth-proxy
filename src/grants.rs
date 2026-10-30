@@ -8,6 +8,16 @@ pub const GRANTABLE_AGENT_CAPABILITIES: &[&str] = &[
     "wait_own_output",
 ];
 
+/// The default grant ceiling for an orchestrator whose token has no explicit
+/// `perm.agent_grants`. It is the full advertised set, so every capability
+/// shown by `auth.methods` can actually be granted.
+pub fn default_orchestrator_grants() -> Vec<String> {
+    GRANTABLE_AGENT_CAPABILITIES
+        .iter()
+        .map(|grant| (*grant).to_string())
+        .collect()
+}
+
 pub fn validate(grants: &[String]) -> Result<(), String> {
     for grant in grants {
         if !GRANTABLE_AGENT_CAPABILITIES.contains(&grant.as_str()) {
@@ -60,6 +70,21 @@ mod tests {
         assert!(methods.contains(&"pane.report_agent_session"));
         assert!(methods.contains(&"ping"));
         assert!(!methods.contains(&"pane.read"));
+    }
+
+    #[test]
+    fn default_ceiling_covers_every_advertised_capability() {
+        let default = default_orchestrator_grants();
+        assert_eq!(
+            default,
+            GRANTABLE_AGENT_CAPABILITIES
+                .iter()
+                .map(|grant| (*grant).to_string())
+                .collect::<Vec<_>>()
+        );
+        for grant in GRANTABLE_AGENT_CAPABILITIES {
+            assert!(default.iter().any(|allowed| allowed == grant));
+        }
     }
 
     #[test]

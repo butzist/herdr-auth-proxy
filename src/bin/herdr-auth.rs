@@ -7,9 +7,10 @@
 //! plus the proxy's `auth.*` extension methods.
 //!
 //! Authentication: the JWT is taken from `--token`, `--token-file`, or
-//! `$HERDR_AUTH_JWT` and sent as an `auth.hello` first line. Without a token the
-//! CLI still connects; the proxy then falls back to reading `HERDR_AUTH_JWT`
-//! from the CLI process environment (peer-environ mode).
+//! `$HERDR_AUTH_JWT` (in that order of precedence) and sent as an `auth.hello`
+//! first line. Without a token the CLI still connects; the proxy then falls
+//! back to reading `HERDR_AUTH_JWT` from the CLI process environment
+//! (peer-environ mode).
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
@@ -35,8 +36,8 @@ struct Cli {
     #[arg(long, global = true, env = "HERDR_AUTH_SOCKET")]
     socket: Option<PathBuf>,
 
-    /// JWT for this request (prefer $HERDR_AUTH_JWT or --token-file; flags leak into ps)
-    #[arg(long, global = true, env = "HERDR_AUTH_JWT", hide_env_values = true)]
+    /// JWT for this request (overrides $HERDR_AUTH_JWT; prefer --token-file since flags leak into ps)
+    #[arg(long, global = true)]
     token: Option<String>,
 
     /// File containing the JWT
@@ -96,7 +97,7 @@ enum TokenCommand {
         /// Label suffix; the token sub is always prefixed with the minter sub
         #[arg(long)]
         sub: Option<String>,
-        /// Lifetime in seconds (clamped to the caller's mint cap)
+        /// Lifetime in seconds (clamped to max_token_ttl_s and the caller's mint cap)
         #[arg(long)]
         ttl_s: Option<u64>,
         /// Bind an agent token to a pane
@@ -108,10 +109,10 @@ enum TokenCommand {
         /// Workspace this token may create tabs/panes in
         #[arg(long = "workspace")]
         workspace_id: Option<String>,
-        /// Capability to grant (repeatable)
+        /// Capability to grant an agent token (repeatable)
         #[arg(long = "grant")]
         grants: Vec<String>,
-        /// Extra permission object as JSON (orchestrator tokens)
+        /// Extra permission object as JSON (orchestrator tokens only)
         #[arg(long)]
         perm: Option<String>,
     },
@@ -135,7 +136,7 @@ enum AgentCommand {
         label: Option<String>,
         #[arg(long)]
         focus: bool,
-        /// Lifetime of the agent token in seconds
+        /// Lifetime of the agent token in seconds (clamped to max_token_ttl_s)
         #[arg(long)]
         ttl_s: Option<u64>,
         /// Capability to grant the agent (repeatable)
@@ -326,21 +327,34 @@ fn parse_json(text: &str, source: &str) -> Result<Value, String> {
 }
 
 fn resolve_token(cli: &Cli) -> Result<Option<String>, String> {
-    if let Some(token) = cli
-        .token
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    let env_token = std::env::var("HERDR_AUTH_JWT").ok();
+    resolve_token_from(
+        cli.token.as_deref(),
+        cli.token_file.as_deref(),
+        env_token.as_deref(),
+    )
+}
+
+/// Explicit flags win over the inherited environment: `HERDR_AUTH_JWT` must not
+/// silently turn a `--token`/`--token-file` test into an orchestrator call.
+fn resolve_token_from(
+    token: Option<&str>,
+    token_file: Option<&Path>,
+    env_token: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
         return Ok(Some(token.to_owned()));
     }
-    if let Some(path) = &cli.token_file {
+    if let Some(path) = token_file {
         let token = fs::read_to_string(path)
             .map_err(|error| format!("read token file {}: {error}", path.display()))?;
         let token = token.trim();
         if token.is_empty() {
             return Err(format!("token file {} is empty", path.display()));
         }
+        return Ok(Some(token.to_owned()));
+    }
+    if let Some(token) = env_token.map(str::trim).filter(|token| !token.is_empty()) {
         return Ok(Some(token.to_owned()));
     }
     Ok(None)
@@ -498,6 +512,28 @@ mod tests {
         assert_eq!(params["cwd"], json!("/work"));
         assert_eq!(params["workspace_id"], json!("w1"));
         assert_eq!(params["grants"], json!(["report_metadata"]));
+    }
+
+    #[test]
+    fn explicit_token_beats_environment() {
+        let resolved = resolve_token_from(Some("flag"), None, Some("env")).unwrap();
+        assert_eq!(resolved.as_deref(), Some("flag"));
+    }
+
+    #[test]
+    fn explicit_token_file_beats_environment() {
+        let path = std::env::temp_dir().join(format!("hap-token-{}", request_id("test")));
+        std::fs::write(&path, "file\n").unwrap();
+        let resolved = resolve_token_from(None, Some(&path), Some("env")).unwrap();
+        assert_eq!(resolved.as_deref(), Some("file"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn environment_is_the_fallback() {
+        let resolved = resolve_token_from(None, None, Some("env")).unwrap();
+        assert_eq!(resolved.as_deref(), Some("env"));
+        assert_eq!(resolve_token_from(None, None, Some("  ")).unwrap(), None);
     }
 
     #[test]

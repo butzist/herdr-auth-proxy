@@ -39,7 +39,11 @@ pub fn method_of(request: &Value) -> &str {
 }
 
 pub fn params_of(request: &Value) -> Value {
-    request.get("params").cloned().unwrap_or_else(|| json!({}))
+    request
+        .get("params")
+        .filter(|params| params.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}))
 }
 
 pub fn ok(id: &Value, result: Value) -> String {
@@ -48,4 +52,20 @@ pub fn ok(id: &Value, result: Value) -> String {
 
 pub fn error(id: &Value, code: &str, message: &str) -> String {
     json!({ "id": id, "error": { "code": code, "message": message } }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_object_params_are_replaced_by_an_empty_object() {
+        assert_eq!(params_of(&json!({"params": []})), json!({}));
+        assert_eq!(params_of(&json!({"params": "x"})), json!({}));
+        assert_eq!(params_of(&json!({})), json!({}));
+        assert_eq!(
+            params_of(&json!({"params": {"pane_id": "w1:p1"}})),
+            json!({"pane_id": "w1:p1"})
+        );
+    }
 }
