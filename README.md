@@ -88,18 +88,24 @@ to disk. There is no private-key file to protect. State lives in
 `herdr-auth-proxy wrap` starts the proxy, receives a process-scoped bootstrap
 token from it over a pipe, and sets that token as `HERDR_AUTH_JWT` in the herdr
 process environment. Herdr passes that environment to every shell it spawns, so
-`herdr-auth-proxy mint` and `herdr-auth token mint` work from any shell. The
-bootstrap token is **orchestrator-scoped**: it can mint agent or orchestrator
-tokens, but never admin tokens. `--cwd` and `--workspace` are required when
-minting an orchestrator token.
+`herdr-auth token mint` works from any shell. The bootstrap token is
+**orchestrator-scoped**: it can mint agent or orchestrator tokens, but never
+admin tokens. `--cwd` and `--workspace` are required when minting an
+orchestrator token.
 
 ```bash
 herdr-auth-proxy wrap -- herdr
 
 # In a shell pane created by herdr (it inherits HERDR_AUTH_JWT):
-herdr-auth-proxy mint --role orchestrator --sub orch --cwd /work --workspace w1 \
-  --perm '{"agent_grants":["report_status","read_own_pane"],"agent_kinds":["opencode"]}'
+export HERDR_AUTH_JWT="$(
+  herdr-auth token mint --role orchestrator --sub orch --cwd /work --workspace w1 \
+    --perm '{"agent_grants":["report_status","read_own_pane"],"agent_kinds":["opencode"]}' \
+  | jq -r .token
+)"
 ```
+
+`herdr-auth-proxy` manages the proxy session (`serve`, `wrap`, `stop`,
+`status`); token minting and agent operations are in `herdr-auth`.
 
 Pane-bound agent tokens can only be minted for a pane the minter owns; the
 bootstrap token owns no panes. Use `auth.agent.spawn` (or an orchestrator token)
@@ -157,13 +163,14 @@ Additional rules:
 - Child `exp` is clamped to the minter's `exp` and its `mint_max_ttl_s`. Agent
   tokens default to 24 h; orchestrator tokens have no default expiry unless
   `--ttl_s` is supplied.
-- `herdr-auth-proxy mint` defaults to `--role orchestrator`.
-  `herdr-auth token mint` defaults to `--role agent`.
+- `herdr-auth token mint` defaults to `--role agent`; pass `--role orchestrator`
+  for the initial bootstrap token. `herdr-auth-proxy` has no mint subcommand.
 
 ## `herdr-auth` CLI
 
 Ships with the proxy; speaks the same NDJSON envelope plus the `auth.*`
-extension methods.
+extension methods. This is the command used for token minting and agent
+operations; `herdr-auth-proxy` only manages the proxy session.
 
 ```bash
 export HERDR_AUTH_SOCKET="$XDG_RUNTIME_DIR/herdr-auth-proxy/auth.sock"

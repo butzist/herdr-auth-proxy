@@ -159,7 +159,8 @@ Binaries:
 
 | Binary | Role |
 |---|---|
-| `herdr-auth-proxy` | server: `serve` (default), `wrap`, `mint` (via the running proxy), `stop`, `status`. |
+| `herdr-auth-proxy` | session management only: `serve` (default), `wrap`, `stop`, `status`. |
+| `herdr-auth` | client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`. |
 | `herdr-auth-launch` | *deferred / optional later feature*: client helper (exec + relay modes) for deployments without a sandbox wrapper (§11). |
 
 ## 4. Authentication design
@@ -174,9 +175,9 @@ Binaries:
   `herdr-auth-proxy wrap`, the token is sent to `wrap` over a pipe (never
   written to disk), and `wrap` sets it as `HERDR_AUTH_JWT` in the herdr process
   environment. Herdr passes that environment to every shell it spawns, so
-  `herdr-auth-proxy mint` / `herdr-auth token mint` work from any shell. The
-  bootstrap token may mint **agent or orchestrator** tokens but never admin; an
-  orchestrator token requires `cwd`. The bootstrap token is a bearer token, not
+  `herdr-auth token mint` works from any shell. The bootstrap token may mint
+  **agent or orchestrator** tokens but never admin; an orchestrator token
+  requires `cwd` and `workspace_id`. The bootstrap token is a bearer token, not
   the signing key: it cannot forge tokens and dies with the proxy. Bootstrap is
   **capability-based, not user-identity-based** — the proxy cannot distinguish
   the operator from an agent by uid (bwrap keeps the herdr uid). Because the
@@ -590,7 +591,7 @@ Decided in review:
 - **Bootstrap**: `herdr-auth-proxy wrap` receives the process-scoped,
   orchestrator-scoped bootstrap token from the proxy over a pipe and sets it as
   `HERDR_AUTH_JWT` on the herdr process; all herdr shells inherit it. No file is
-  written. `herdr-auth-proxy mint` uses that environment token to mint agent or
+  written. `herdr-auth token mint` uses that environment token to mint agent or
   orchestrator tokens (an orchestrator token requires both `cwd` and
   `workspace_id`), but **cannot mint admin**.
   The signing key stays in memory, so a proxy restart invalidates all tokens. The
