@@ -119,6 +119,10 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 
 - [x] `herdr-auth-proxy wrap -- herdr "$@"`: resolve the herdr socket like herdr,
       ensure the proxy is running (idempotent), then exec herdr
+- [x] `wrap` always exports a valid `HERDR_AUTH_JWT`: on an already-running proxy
+      it re-adopts the herdr server's token (verified with `auth.hello`), replaces
+      the proxy when no server is running, and fails closed if a running server
+      has no usable token (its env cannot be changed externally)
 - [x] Proxy daemonizing: `setsid`, log + pidfile, detached from the client
 - [x] Self-exit when the upstream has been unreachable for `death_grace_s`;
       `stop`/`status` subcommands

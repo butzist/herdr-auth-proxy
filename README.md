@@ -93,6 +93,13 @@ process environment. Herdr passes that environment to every shell it spawns, so
 admin tokens. `--cwd` and `--workspace` are required when minting an
 orchestrator token.
 
+`wrap` also works when the proxy is already running: it re-adopts the token the
+running herdr server carries (verifying it with the current proxy) instead of
+silently leaving the session without one. If the proxy is running but the herdr
+server is not, `wrap` replaces the proxy so it gets a fresh bootstrap token. If
+a herdr server is already running **without** a usable token, `wrap` fails with
+a clear error — restart that server (`herdr server stop`) and run `wrap` again.
+
 ```bash
 herdr-auth-proxy wrap -- herdr
 
@@ -114,10 +121,11 @@ to create/bind agent tokens.
 `mint` uses `HERDR_AUTH_JWT` from its environment. Because every shell inherits
 the bootstrap token, any command in a user shell can mint agent/orchestrator
 tokens; that is the trade-off of the env-based design. The herdr **server** must
-be started through `wrap` (or restarted under it) so it inherits the token; a
-server already running without it will not have the bootstrap token. The
-bootstrap token is visible through `/proc/<pid>/environ` to same-uid processes.
-**Restarting the
+be started through `wrap` (or restarted under it) so it inherits the token;
+`wrap` reuses the running server's token when possible and errors when the
+server has none (a running server's environment cannot be changed from outside).
+The bootstrap token is visible through `/proc/<pid>/environ` to same-uid
+processes. **Restarting the
 proxy invalidates every token**, so re-mint after a restart. Any `keys/`
 directory left by an older version is now ignored and may be deleted.
 
