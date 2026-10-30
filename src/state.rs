@@ -11,6 +11,9 @@ pub struct Entry {
     pub sub: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// Canonical working directory the pane was created in, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -57,12 +60,13 @@ impl State {
             .retain(|_, token| token.exp.is_none_or(|exp| exp > now));
     }
 
-    pub fn record_pane(&mut self, pane_id: &str, sub: &str, jti: Option<&str>) {
+    pub fn record_pane(&mut self, pane_id: &str, sub: &str, jti: Option<&str>, cwd: Option<&str>) {
         self.panes.insert(
             pane_id.to_owned(),
             Entry {
                 sub: sub.to_owned(),
                 jti: jti.map(str::to_owned),
+                cwd: cwd.map(str::to_owned),
             },
         );
     }
@@ -73,8 +77,15 @@ impl State {
             Entry {
                 sub: sub.to_owned(),
                 jti: None,
+                cwd: None,
             },
         );
+    }
+
+    pub fn pane_cwd(&self, pane_id: &str) -> Option<&str> {
+        self.panes
+            .get(pane_id)
+            .and_then(|entry| entry.cwd.as_deref())
     }
 
     pub fn bind_token(&mut self, jti: &str, pane_id: &str) {
@@ -109,8 +120,9 @@ mod tests {
     #[test]
     fn ownership_roundtrip() {
         let mut state = State::default();
-        state.record_pane("w1:p1", "alice", None);
+        state.record_pane("w1:p1", "alice", None, Some("/work"));
         state.record_tab("w1:t1", "alice");
+        assert_eq!(state.pane_cwd("w1:p1"), Some("/work"));
         assert!(state.owns_pane("w1:p1", "alice"));
         assert!(!state.owns_pane("w1:p1", "bob"));
         assert!(state.owns_tab("w1:t1", "alice"));

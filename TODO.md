@@ -32,10 +32,15 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 
 ## Phase 1 — keys & config
 
-- [x] Ed25519 keypair generation on first run in config dir (private key 0600,
-      never overwrite existing)
+- [x] In-memory HS256 signing key generated at proxy startup (never persisted;
+      restart invalidates all tokens)
+- [x] Process-scoped, orchestrator-scoped bootstrap token handed from the proxy
+      to `wrap` over a pipe and set as `HERDR_AUTH_JWT` on herdr; all shells
+      inherit it; no bootstrap file. It mints agent/orchestrator tokens but not
+      admin
 - [x] `config.toml` loading (upstream/auth socket, agent TTL, death grace)
-- [x] JWT claim types (sub, role, pane_id, grants, perm) + sign/verify
+- [x] JWT claim types (sub, role, pane_id, cwd, workspace_id, grants, perm) +
+      sign/verify
 
 ## Phase 2 — proxy core
 
@@ -48,7 +53,7 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 
 ## Phase 3 — auth
 
-- [x] `auth.hello` wire mode (first line, EdDSA verify, exp/nbf)
+- [x] `auth.hello` wire mode (first line, HS256 verify, exp/nbf)
 - [x] Peer-environ extraction mode (`/proc/<pid>/environ` → `HERDR_AUTH_JWT`,
       cross-check `HERDR_PANE_ID` vs claim)
 - [x] Fail-closed unauth error (`unauthorized`, close); `auth.whoami`
@@ -58,9 +63,13 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 
 - [x] Method registry (103 herdr methods, protocol 22) embedded
 - [x] Explicit role allowlists (default-deny; no danger-class wildcards)
-- [x] Param guards: agent `pane_id` forcing; `agent.start` kind whitelist
-      (args passed through); `layout.apply` denied; **env authority** for
-      `pane.split`/`tab.create` (proxy injects JWT)
+- [x] Param guards: agent `pane_id`/`target` forcing and ownership; pane-bound
+      minting requires an owned pane; `auth.agent.spawn` kind is globally capped
+      to `opencode` (args passed through); `layout.apply` denied; **env
+      authority** for the atomic spawn path; **cwd/workspace authority**: token
+      `cwd` and `workspace_id` are the only directory/workspace for spawn,
+      caller overrides rejected; direct `pane.split`/`tab.create`/`agent.start`
+      denied to orchestrators
 - [x] Owned-only visibility: filter `pane.list`/`agent.list`/`tab.list`
 - [x] Default-deny for unknown methods + `[new-command]` WARN logging
 - [ ] Compare upstream `ping.protocol` with the embedded registry and warn
@@ -70,19 +79,20 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] `agent` preset (report-only, pane-bound) — verified against a fake
       upstream; still to prove with the real opencode integration plugin
 - [x] `orchestrator` preset: **minimal explicit allowlist, default-deny**
-      (owned-only reads + own-pane ops + `agent.start` kind `[opencode]` + args
-      to the wrapper + `pane.split`/`tab.create` + `auth.agent.spawn` +
-      `auth.token.mint`); nothing else
-- [x] `admin` preset + local bootstrap `mint` subcommand
+      (owned-only reads + own-pane ops + **only** `auth.agent.spawn` for
+      creation/start + `auth.token.mint`); direct `pane.split`/`tab.create`/
+      `agent.start` denied; nothing else
+- [x] Bootstrap `mint` subcommand mints agent or orchestrator tokens; bootstrap
+      cannot mint admin; `admin` role remains reserved
 - [x] Document & validate the **bwrap wrapper contract** (§ ARCHITECTURE 4.3):
       hides herdr's real socket, `HERDR_SOCKET_PATH` → `auth.sock`,
       `HERDR_AUTH_JWT` passthrough, validates agent args, no fallback
 
 ## Phase 6 — minting
 
-- [x] `auth.token.mint`: minter scope check, permission-subset intersection,
-      `exp` clamped to minter `exp` (infinite minter → default 24 h), child
-      `owner` claim, `jti` uniqueness
+- [x] `auth.token.mint`: fixed role minting rules (no `mint_roles` field),
+      permission-subset intersection, `exp` clamped to minter `exp` (infinite
+      minter → default 24 h), derived child `sub`, `jti` uniqueness
 - [x] `auth.agent.spawn` (atomic): `tab.create` → bind pending `jti` to
       `root_pane.pane_id` → `agent.start` (kind whitelist; args passed to the
       wrapper); on failure close the tab + revoke the token
@@ -119,8 +129,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] Nix packaging: `packages.default` (both binaries), `apps`, `overlays`,
       `nixosModules.default`, `homeManagerModules.default`, `formatter`;
       verified with `nix build .#`
-- [ ] README quick-start: install → bootstrap admin token → mint orchestrator →
-      spawn gated opencode agent
+- [ ] README quick-start: install → bootstrap orchestrator token → spawn gated
+      opencode agent
 
 ## Phase 10 — hardening & tests
 

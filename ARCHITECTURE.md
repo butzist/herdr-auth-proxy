@@ -14,8 +14,9 @@ it exits by itself when the herdr server goes away (§10).
   socket** (downstream) that speaks herdr's JSON API protocol.
 - Each downstream connection is **authenticated with a JWT**; each request is
   **filtered** against the permissions in that JWT.
-- An asymmetric **Ed25519 keypair is generated in the config dir on first run**;
-  the private key signs all JWTs, the public key verifies them.
+- A fresh **HMAC-SHA256 signing key is generated in memory on every proxy start**.
+  It is never written to disk, so the config dir contains no signing secret and
+  all outstanding tokens become invalid when the proxy restarts.
 
 In scope (v1): the **JSON API socket** (`herdr.sock`, NDJSON). This is what agents,
 CLIs and integrations use — including the herdr opencode integration plugin.
@@ -158,24 +159,57 @@ Binaries:
 
 | Binary | Role |
 |---|---|
-| `herdr-auth-proxy` | server: `serve` (default), `mint` (local bootstrap), `keygen`. |
+| `herdr-auth-proxy` | server: `serve` (default), `wrap`, `mint` (via the running proxy), `stop`, `status`. |
 | `herdr-auth-launch` | *deferred / optional later feature*: client helper (exec + relay modes) for deployments without a sandbox wrapper (§11). |
 
 ## 4. Authentication design
 
 ### 4.1 Keys & JWTs
 
-- **Ed25519 keypair generated on first run** in the config dir
-  (`/etc/herdr-auth-proxy/` system mode, XDG config in user mode), private key
-  `0600`. Existing keys are never overwritten.
-- JWT (EdDSA/JWS): claims `iss="herdr-auth-proxy"`, `sub`, `jti`, `iat`, `nbf`,
-  `exp`, `role` (`agent`|`orchestrator`|`admin`), and:
+- **Signing key:** 32 random bytes generated at startup and kept only in the
+  proxy's memory. Tokens are HS256 JWTs; there is no private key file, and a
+  proxy restart invalidates every token (re-mint after restart).
+- **Bootstrap:** at startup the proxy mints a process-scoped
+  **orchestrator-scoped** JWT (`sub="bootstrap"`). When started by
+  `herdr-auth-proxy wrap`, the token is sent to `wrap` over a pipe (never
+  written to disk), and `wrap` sets it as `HERDR_AUTH_JWT` in the herdr process
+  environment. Herdr passes that environment to every shell it spawns, so
+  `herdr-auth-proxy mint` / `herdr-auth token mint` work from any shell. The
+  bootstrap token may mint **agent or orchestrator** tokens but never admin; an
+  orchestrator token requires `cwd`. The bootstrap token is a bearer token, not
+  the signing key: it cannot forge tokens and dies with the proxy. Bootstrap is
+  **capability-based, not user-identity-based** — the proxy cannot distinguish
+  the operator from an agent by uid (bwrap keeps the herdr uid). Because the
+  token is inherited by all shells and visible via `/proc/<pid>/environ`, a
+  sandbox must use a private PID/`/proc`, and the wrapper must reject non-agent
+  tokens. Panes created by `auth.agent.spawn` get a freshly minted agent token
+  overriding the inherited bootstrap token; panes created directly in the TUI
+  keep the bootstrap token (do not run the agent wrapper there with it).
+- JWT (HS256/JWS): claims `iss="herdr-auth-proxy"`, `sub`, `jti`, `iat`, `nbf`,
+  `exp`, `role` (`agent`|`orchestrator`|`admin`), `cwd` (canonical working
+  directory for panes/agents), `workspace_id` (the only workspace the token may
+  create tabs/panes in), and:
   - agent role: `pane_id` (bound to one pane), `grants` (subset of the
-    grantable capabilities below), optional `report_source`.
-  - orchestrator role: `perm` object — method allow/deny list (preset + overrides),
-    `agent_kinds` whitelist (`["opencode"]`), `agent_grants` (which capabilities
-    it may hand to spawned agents), `mint` scope (`roles`, `max_ttl_s`,
-    subset-only), `panes` scope (owned-only).
+    grantable capabilities below).
+  - orchestrator role: `perm` object — `agent_kinds` (can only narrow the
+    global `["opencode"]` wrapper list), `agent_grants` (which capabilities it
+    may hand to spawned agents), `mint_max_ttl_s` (TTL cap). Method allow/deny
+    is fixed by role, not token-controlled. Its `cwd` and `workspace_id` are the
+    only directory/workspace it may create panes in; child agent tokens inherit
+    them and cannot widen them.
+- Role minting is fixed: agent → none; orchestrator → agent only; bootstrap →
+  agent or orchestrator (never admin); admin → any (reserved, not bootstrapped).
+- Minting rules:
+  - `cwd` and `workspace_id` are required for bootstrap-minted orchestrator
+    tokens; orchestrators inherit both and cannot change them.
+  - `pane_id` is valid only for agent tokens and only if the minter owns the
+    pane. Bootstrap owns no panes; use `auth.agent.spawn` for bound agents.
+  - child `sub` is always `minter:jti[:label]`; a caller cannot choose a bare
+    `sub` or impersonate another owner.
+  - `perm.agent_kinds` may only narrow the global sandboxed list (`opencode`);
+    `perm.mint_max_ttl_s` caps the child TTL. `mint_roles` was removed.
+  - child `exp` is clamped to the minter's `exp` and TTL cap; agent tokens
+    default to 24 h.
 - TTL: a child token's `exp` is always **clamped to the parent's `exp`** (a child
   never outlives its minter). When the minter is an infinite orchestrator token,
   the requested/default agent TTL applies (default 24 h, configurable), and the
@@ -212,22 +246,31 @@ its own **bwrap-based wrapper** for the `opencode` executable. No shell changes
 **Wrapper contract** (what the deployment provides):
 
 1. start the agent in a bwrap sandbox whose mount namespace **hides herdr's real
-   socket** (e.g. no `~/.config/herdr` bind) — this is the security boundary; the
-   uid is unchanged (§6.2);
-2. bind/derive the proxy socket inside the sandbox and export
-   `HERDR_SOCKET_PATH=<auth.sock>` for the agent;
-3. forward `HERDR_AUTH_JWT` from the pane env into the sandbox (strip any
+   socket** (no `~/.config/herdr` bind) **and always bind `/dev/null` over every
+   real herdr socket** inside the namespace (`herdr.sock`,
+   `herdr-client.sock`, the active session equivalents, and any inherited
+   custom `HERDR_SOCKET_PATH` plus its `-client` sibling) — this is the security
+   boundary; the uid is unchanged (§6.2);
+2. use a **private PID namespace and `/proc`** (`--unshare-pid --proc /proc`) so
+   the agent cannot read the inherited bootstrap token or other peer tokens via
+   `/proc/<pid>/environ`;
+3. bind **only the proxy's `auth.sock`** (not the whole runtime dir, which also
+   contains the pid file) and export `HERDR_SOCKET_PATH=<auth.sock>` for the
+   agent;
+4. forward `HERDR_AUTH_JWT` from the pane env into the sandbox (strip any
    inherited/foreign token first);
-4. validate agent arguments itself — the proxy passes `args` through unchanged
+5. validate agent arguments itself — the proxy passes `args` through unchanged
    and whitelists only the `kind`;
-5. never fall back to herdr's original `HERDR_SOCKET_PATH`.
+6. set the agent cwd from the token's `cwd` claim and never fall back to herdr's
+   original `HERDR_SOCKET_PATH`.
 
-Panes created by the orchestrator are plain shells (herdr's real socket path in
-their env). That is harmless because raw input is denied: the only command that
-can ever be typed into them is `agent.start` with the whitelisted `opencode`
-wrapper, which sandboxes and re-points the agent. `layout.apply` is denied
-because it would let a caller specify arbitrary argv that herdr executes directly
-(as the herdr user, with the real socket path), i.e. a full bypass.
+Panes created by `auth.agent.spawn` are still plain shells internally (herdr's
+real socket path in their env), but raw input is denied and the only command
+ever typed into them is the whitelisted `opencode` wrapper, which sandboxes and
+re-points the agent. Orchestrators cannot create a plain pane directly:
+`pane.split`, `tab.create` and `agent.start` are denied. `layout.apply` is
+denied because it would let a caller specify arbitrary argv that herdr executes
+directly (as the herdr user, with the real socket path), i.e. a full bypass.
 
 `herdr-auth-launch` (exec mode: re-point + optional uid drop; relay mode:
 per-client socket + `auth.hello` stamping) is **deferred** (§11) for deployments
@@ -264,12 +307,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    S([orchestrator wants a new agent]) --> T1["auth.token.mint {role:agent,<br/>pane-bound, ttl, subset perm}"]
-    T1 --> T2{minter JWT has mint scope<br/>and perm superset?}
+    S([orchestrator wants a new agent]) --> A0["auth.agent.spawn {kind, args,<br/>grants, ttl}"]
+    A0 --> T2{minter JWT has cwd,<br/>kind/grant scope?}
     T2 -- no --> D1[error forbidden] --> X([end])
     T2 -- yes --> T3[proxy signs child JWT,<br/>records owner = minter sub]
-    T3 --> P1["pane.split or tab.create<br/>(proxy builds env, binds child token)"]
-    P1 --> P2["agent.start {kind: opencode,<br/>args passed through (wrapper validates)}<br/>or atomic auth.agent.spawn"]
+    T3 --> P1["tab.create {cwd: token cwd,<br/>env: proxy-built child JWT}"]
+    P1 --> P2["agent.start {kind: opencode,<br/>args passed through (wrapper validates)}"]
     P2 --> P3[herdr types 'opencode &lt;args&gt;' into the pane shell]
     P3 --> P4[bwrap wrapper hides herdr.sock,<br/>sets HERDR_SOCKET_PATH := auth.sock,<br/>forwards HERDR_AUTH_JWT]
     P4 --> P5[agent + opencode plugin connect to auth.sock;<br/>JWT picked up from environ]
@@ -279,16 +322,17 @@ flowchart TD
     O1 --> X
 ```
 
-(The atomic `auth.agent.spawn` does mint + `tab.create` + `agent.start` in one
-call, with token binding and failure cleanup — §7.1.)
+The atomic `auth.agent.spawn` does mint + `tab.create` + `agent.start` in one
+call, with token binding and failure cleanup (§7.1). Direct `pane.split`,
+`tab.create` and `agent.start` are denied for orchestrators.
 
 ## 5. Personas
 
 | Persona | Token | Allowed herdr methods (default) |
 |---|---|---|
 | **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` **forced** to the claim); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output` (own pane). Default: `["report_status"]`. Exactly covers the opencode plugin. |
-| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: `pane.split`, `tab.create` (proxy env authority, owned, auto-bound); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.start` (kind `["opencode"]`; args passed to the wrapper), `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
-| **admin** (bootstrap) | role=admin | all methods + `auth.*`. Minted locally on first setup. |
+| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including direct `pane.split`, `tab.create` and `agent.start` (they create/use plain shells), `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
+| **admin** (reserved) | role=admin | All methods + `auth.*`; not issued by the default bootstrap (the bootstrap token is orchestrator-scoped and cannot mint admin). |
 
 **Grantable agent capabilities.** An orchestrator may grant only a subset of
 this list *and* of its own `agent_grants` (a child never exceeds its parent).
@@ -309,25 +353,31 @@ deliberately added. That includes all raw input (`pane.send_text`,
 user), `events.*` (unfiltered events would leak non-owned panes — use
 `agent.wait`/`agent.read`), `workspace.*`, `worktree.*`, `plugin.*`,
 `integration.*`, `server.*`, `notification.show`, and all UI methods.
-`pane.split` and `tab.create` are allowed **only with the env authority** (§7):
-the proxy builds the env, mints/binds the child token (from the response's
-`pane`/`root_pane`), and records ownership. The resulting shell is a plain shell,
-but it can only ever receive `agent.start` with the whitelisted kind (raw input is
-denied), so the only process spawned in it is the bwrap sandbox wrapper, which
-sets `HERDR_SOCKET_PATH` and hides the real socket. `layout.apply` is denied: it
-takes explicit argv (bypassing the wrapper) and herdr executes it as the herdr
-user with the real socket path — a full bypass.
+The orchestrator cannot create a plain pane: `pane.split`, `tab.create` and
+`agent.start` are denied. The only creation path is `auth.agent.spawn`, which
+mints the child token, creates the root pane with the proxy-built env and token
+`cwd`, starts the whitelisted wrapper, and records ownership (§7.1). The
+resulting shell is a plain shell, but the only command ever typed into it is the
+sandbox wrapper (raw input is denied), so the agent runs under bwrap and never
+with herdr's real socket. `layout.apply` is denied: it takes explicit argv
+(bypassing the wrapper) and herdr executes it as the herdr user with the real
+socket path — a full bypass.
 
 ## 6. Security boundary & bypass prevention
 
 1. **The proxy is the only auth boundary** — herdr contributes none (§2.1).
 2. **Sandboxed agents must not be able to open herdr's real socket.** The
    deployment's **bwrap** wrapper hides `~/.config/herdr` (the socket) in the
-   mount namespace; the uid stays the herdr uid, so **uid is not a trust signal**
-   and the proxy never authorizes by uid (§4.2). If the sandbox leaks the real
-   socket path, the agent can bypass the proxy entirely — the wrapper's mount
-   configuration is the boundary. Because uid is shared, the proxy must be able
-   to read the peer's environ (same uid, or run as root).
+   mount namespace **and binds `/dev/null` over every real herdr socket path**
+   (`herdr.sock`, `herdr-client.sock`, session equivalents) so a stray bind or
+   forgotten hide still cannot expose a connectable socket. The uid stays the
+   herdr uid, so **uid is not a trust signal** and the proxy never authorizes by
+   uid (§4.2). If the sandbox leaks the real socket path, the agent can bypass
+   the proxy entirely — the wrapper's mount configuration is the boundary.
+   Because uid is shared, the proxy must be able to read the peer's environ
+   (same uid, or run as root). The sandbox must also use a private PID
+   namespace / `/proc`, otherwise `/proc/<pid>/environ` exposes the inherited
+   bootstrap token (and other peer tokens).
 3. **auth.sock is world-connectable by design** (`0666` or group ACL) — connecting
    is free, *authorizing* is the JWT. Unauthenticated connections are rejected
    at the first line; local DoS surface is accepted.
@@ -354,15 +404,23 @@ user with the real socket path — a full bypass.
 - Per-method **danger classes** (our own, not herdr's `changes_ui`):
   `readonly`, `ui`, `raw_input`, `spawn`, `lifecycle`, `admin`.
 - **Param guards**: pane-targeting methods check ownership (§9); agent-role
-  `pane_id` params are overwritten with the claim; `agent.start` whitelists the
-  `kind` only (`["opencode"]`, the sandbox wrapper) and passes `args` through —
-  the wrapper validates them; `layout.apply` is denied (explicit argv = bypass).
+  `pane_id` params are overwritten with the claim; `auth.agent.spawn` whitelists
+  the `kind` only (`["opencode"]`, the sandbox wrapper) and passes `args`
+  through — the wrapper validates them; direct `agent.start` is denied to
+  orchestrators; `layout.apply` is denied (explicit argv = bypass).
   **Env authority**: for every process-launching method the proxy builds the env
   — caller env is validated, not trusted: only `HERDR_AUTH_JWT` (proxy-injected)
   and caller-approved keys survive; `PATH`, `SHELL`, `ENV`, `BASH_ENV`,
   `LD_PRELOAD`, `LD_LIBRARY_PATH`, `NODE_OPTIONS`, `PYTHON*` and all `HERDR_*`
   are stripped (herdr overrides its own anyway). The proxy injects the child
   token and never lets the caller choose a gating mode.
+  **Cwd/workspace authority**: `auth.agent.spawn` always uses the caller
+  token's canonical `cwd` and `workspace_id`; a caller-supplied value must equal
+  the claim or the request is `forbidden` (`missing_cwd` / `missing_workspace`
+  if the token has none). The resolved pane cwd is recorded in proxy state.
+  Direct `pane.split` / `tab.create` are admin-only and use the same rule when
+  the admin token carries those claims. herdr 0.9.5's `agent.start` has no cwd
+  parameter — the agent inherits the pane shell's cwd.
 - **Owned-only visibility**: `pane.list`, `agent.list`, `workspace.list`,
   `tab.list` and `session.snapshot` responses are filtered to the caller's owned
   ids; detail methods on non-owned ids return `forbidden`.
@@ -389,19 +447,22 @@ NDJSON codec:
 | `auth.methods` | proxy-known herdr methods + policy (introspection) |
 | `auth.agent.spawn` | **atomic**: `tab.create` + mint/bind child token + `agent.start` (kind whitelist; args passed to the wrapper); closes the tab and revokes the token if any step fails |
 
-`auth.agent.spawn` params: `kind`, `args`, optional `name`, `cwd`,
-`workspace_id`, `label`, `focus`, `ttl_s`, `grants`, `perm`. The caller never
-supplies `env`; the proxy builds it and injects the child token. Requested
-`grants` are intersected with the global grantable set and the caller's
-`agent_grants`; an over-request is an error (`grant_not_allowed`).
+`auth.agent.spawn` params: `kind`, `args`, optional `name`, `label`, `focus`,
+`ttl_s`, `grants`, `perm`. The caller never supplies `env`; the proxy builds it
+and injects the child token. The tab/root pane is always created in the caller
+token's `cwd` and `workspace_id`; supplied values are only accepted if they
+equal the claims. Requested `grants` are intersected with the global grantable
+set and the caller's `agent_grants`; an over-request is an error
+(`grant_not_allowed`).
 
 **Binding subtlety**: the token must be in the pane env at `tab.create` time, but
 the pane id is only known from the response. Mint a `pending` token (`jti` only),
 inject it, then bind `jti → root_pane.pane_id` on the response and record
 ownership. No agent connects before `agent.start`, so the bind is always in
-place; revoke the `jti` on failure. Direct `pane.split`/`tab.create` work the same
-way (the proxy parses the new `pane`/`root_pane`), so `agent.start` works with or
-without the atomic method — the atomic method adds cleanup and one round-trip.
+place; revoke the `jti` on failure. This is the only creation path exposed to
+orchestrators; direct `pane.split` / `tab.create` / `agent.start` are denied
+(admin-only), so every orchestrator-created pane goes through this binding and
+cleanup path.
 
 **How clients call extensions** (they are not in the herdr CLI):
 
@@ -428,10 +489,11 @@ without the atomic method — the atomic method adds cleanup and one round-trip.
 
 ## 9. Pane ownership (orchestrator use case)
 
-- The proxy records pane/tab/workspace ids **from creation responses**
-  (`pane.split`, `tab.create`; `workspace.create` if ever allowed; `layout.apply`
-  stays denied) against the authenticated `sub` (+ child token `jti` for agent
-  panes).
+- The proxy records pane/tab/workspace ids **from creation responses**. For
+  orchestrators that is the `tab.create` inside `auth.agent.spawn`; admin-only
+  direct `pane.split`/`tab.create` are recorded the same way. `workspace.create`
+  is never allowed for orchestrators and `layout.apply` stays denied. Ownership
+  is keyed by the authenticated `sub` (+ child token `jti` for agent panes).
 - Ownership is **persisted** across restarts (state dir, e.g. SQLite/JSON) — the
   proxy, not herdr, is authoritative.
 - Enforcement: every pane-targeting request validates `pane_id` against the
@@ -477,9 +539,9 @@ agent_ttl_s = 86400
 death_grace_s = 15
 ```
 
-Keys live in `$XDG_CONFIG_HOME/herdr-auth-proxy/keys/`, state in
-`$XDG_STATE_HOME/herdr-auth-proxy/`, the auth socket in
-`$XDG_RUNTIME_DIR/herdr-auth-proxy/`.
+The signing key is never persisted. State lives in
+`$XDG_STATE_HOME/herdr-auth-proxy/`; the auth socket and pid file live in
+`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. There is no bootstrap-token file.
 
 Packaging: `packages.default` builds both binaries;
 `nixosModules.default` (opt-in `programs.herdr-auth-proxy.enable`) and
@@ -495,8 +557,8 @@ Packaging: `packages.default` builds both binaries;
   events carry no client attribution — §2.1).
 - Multi-session / multi-user upstreams (v1: exactly one upstream socket).
 - Token revocation list / short-lived minting cache.
-- Admin minting via a separate control socket (v1: local CLI + private-key
-  possession only — §12).
+- Admin minting via a separate control socket (v1: no admin token is issued by
+  the bootstrap — §12).
 - Non-Linux support (SO_PEERCRED + /proc environ is Linux-only; the deferred
   relay mode would be the portable fallback).
 
@@ -517,16 +579,24 @@ Decided in review:
   `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`,
   `integration.*`, UI and raw-input methods (§5/§7).
 - **`agent.send_keys` denied.**
-- **Spawn**: `pane.split`/`tab.create` (proxy env authority + token auto-binding)
-  and atomic `auth.agent.spawn`; **`layout.apply` denied** — it accepts explicit
-  argv that herdr executes directly as the herdr user with the real socket path
-  (a full bypass).
+- **Spawn**: only the atomic `auth.agent.spawn` (proxy env/cwd authority + token
+  auto-binding + cleanup); direct `pane.split`, `tab.create` and `agent.start`
+  are denied for orchestrators because they create/use plain shells that run
+  arbitrary code as the herdr user. **`layout.apply` denied** — it accepts
+  explicit argv that herdr executes directly as the herdr user with the real
+  socket path (a full bypass). Pane creation and agent start are pinned to the
+  token's `cwd` claim; callers cannot choose a different directory.
 - **Grants**: defined set; default `["report_status"]`; `read_own_pane` opt-in.
-- **Bootstrap**: local `herdr-auth-proxy mint --role admin`; authority is
-  possession of the private key (config dir `0600`). The proxy **cannot** verify
-  that a client can reach `herdr.sock` (bwrap hides paths, uid is shared), so
-  "socket access" is not checkable — key possession (or an admin endpoint placed
-  outside the sandbox) is the check.
+- **Bootstrap**: `herdr-auth-proxy wrap` receives the process-scoped,
+  orchestrator-scoped bootstrap token from the proxy over a pipe and sets it as
+  `HERDR_AUTH_JWT` on the herdr process; all herdr shells inherit it. No file is
+  written. `herdr-auth-proxy mint` uses that environment token to mint agent or
+  orchestrator tokens (an orchestrator token requires both `cwd` and
+  `workspace_id`), but **cannot mint admin**.
+  The signing key stays in memory, so a proxy restart invalidates all tokens. The
+  proxy **cannot** verify that a client is the operator (uid is shared, bwrap
+  keeps the herdr uid); the bootstrap token being confined to herdr's process
+  environment and kept out of sandboxes is the check.
 - **Child token lifetime**: `exp ≤ minter exp`; with an infinite orchestrator the
   default agent TTL applies (24 h), re-mint on restore.
 - **herdr pinning**: CI regenerates the registry and runs the deny tests.

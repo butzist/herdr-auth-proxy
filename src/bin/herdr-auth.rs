@@ -93,6 +93,7 @@ enum TokenCommand {
     Mint {
         #[arg(long, default_value = "agent")]
         role: String,
+        /// Label suffix; the token sub is always prefixed with the minter sub
         #[arg(long)]
         sub: Option<String>,
         /// Lifetime in seconds (clamped to the caller's mint cap)
@@ -101,6 +102,12 @@ enum TokenCommand {
         /// Bind an agent token to a pane
         #[arg(long)]
         pane: Option<String>,
+        /// Safe working directory for panes/agents created with this token
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Workspace this token may create tabs/panes in
+        #[arg(long = "workspace")]
+        workspace_id: Option<String>,
         /// Capability to grant (repeatable)
         #[arg(long = "grant")]
         grants: Vec<String>,
@@ -118,8 +125,10 @@ enum AgentCommand {
         kind: String,
         #[arg(long)]
         name: Option<String>,
+        /// Must match the caller token's cwd; it cannot change the cwd
         #[arg(long)]
         cwd: Option<String>,
+        /// Must match the caller token's workspace_id
         #[arg(long)]
         workspace: Option<String>,
         #[arg(long)]
@@ -202,6 +211,8 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
                     sub,
                     ttl_s,
                     pane,
+                    cwd,
+                    workspace_id,
                     grants,
                     perm,
                 },
@@ -217,6 +228,12 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
             }
             if let Some(pane) = pane {
                 params.insert("pane_id".into(), json!(pane));
+            }
+            if let Some(cwd) = cwd {
+                params.insert("cwd".into(), json!(cwd));
+            }
+            if let Some(workspace_id) = workspace_id {
+                params.insert("workspace_id".into(), json!(workspace_id));
             }
             if !grants.is_empty() {
                 params.insert("grants".into(), json!(grants));
@@ -468,6 +485,8 @@ mod tests {
                 sub: Some("bob".into()),
                 ttl_s: Some(120),
                 pane: Some("w1:p2".into()),
+                cwd: Some("/work".into()),
+                workspace_id: Some("w1".into()),
                 grants: vec!["report_metadata".into()],
                 perm: None,
             },
@@ -476,6 +495,8 @@ mod tests {
         assert_eq!(method, "auth.token.mint");
         assert_eq!(params["role"], json!("agent"));
         assert_eq!(params["pane_id"], json!("w1:p2"));
+        assert_eq!(params["cwd"], json!("/work"));
+        assert_eq!(params["workspace_id"], json!("w1"));
         assert_eq!(params["grants"], json!(["report_metadata"]));
     }
 

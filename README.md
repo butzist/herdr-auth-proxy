@@ -15,17 +15,19 @@ need — and nothing more.
 - Runs as a **lifecycle wrapper around the `herdr` command** (no systemd): it
   starts detached, proxies herdr's JSON API protocol (NDJSON over unix socket),
   and exits when the herdr server goes away.
-- **Authenticates each connection with a JWT** (Ed25519-signed; keypair is generated
-  in the config dir on first run) and **filters commands** according to the
-  permissions in the JWT.
+- **Authenticates each connection with a JWT** (HS256, signed with a random key
+  generated in memory at proxy startup; no key file) and **filters commands**
+  according to the permissions in the JWT. A proxy restart invalidates all
+  outstanding tokens.
 - Supports two main personas:
   1. **agent** — may only report its own status to herdr (exactly what the herdr
      opencode integration plugin does) and optionally read its own pane.
-  2. **orchestrator** — may start agents (kind `opencode`; args are validated by
-     the sandbox wrapper), prompt them, read their status, and create/read/close
-     panes **it owns** (pane ownership is tracked; list responses are filtered).
-     It can *never* send raw shell/pty input, and it can mint scoped child tokens
-     for the agents it creates.
+  2. **orchestrator** — may start agents **only through the atomic
+     `auth.agent.spawn`** (kind `opencode`; args are validated by the sandbox
+     wrapper), prompt them, read their status, and read/close panes **it owns**
+     (pane ownership is tracked; list responses are filtered). It cannot create
+     plain panes and can *never* send raw shell/pty input. It can mint scoped
+     child tokens for the agents it creates.
 - Works with your existing **bwrap sandbox wrapper** (e.g. an `opencode` wrapper
   that hides herdr's real socket in a mount namespace): it only needs to set
   `HERDR_SOCKET_PATH` to the proxy socket, pass `HERDR_AUTH_JWT` through, and
@@ -42,8 +44,8 @@ need — and nothing more.
 
 ## Status
 
-**Early implementation.** The proxy core works (keys/config/JWT, hello +
-peer-environ auth, method allowlists, ownership filtering, mint, atomic spawn,
+**Early implementation.** The proxy core works (in-memory signing key/config/JWT,
+hello + peer-environ auth, method allowlists, ownership filtering, mint, atomic spawn,
 `wrap`/`stop`/`status`) and the `herdr-auth` CLI is complete. Validated against a
 fake upstream; not yet against a real herdr. See
 [ARCHITECTURE.md](ARCHITECTURE.md) (design, herdr findings, diagrams, decisions)
@@ -78,15 +80,85 @@ There is **no systemd unit by design** — start the proxy together with herdr:
 herdr-auth-proxy wrap -- herdr
 ```
 
-Keys are created in `$XDG_CONFIG_HOME/herdr-auth-proxy/keys/`, state in
-`$XDG_STATE_HOME/herdr-auth-proxy/`, and the auth socket in
-`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. Bootstrap tokens locally (requires the
-private key):
+The signing key is generated **in memory** at proxy startup and is never written
+to disk. There is no private-key file to protect. State lives in
+`$XDG_STATE_HOME/herdr-auth-proxy/`; the auth socket and pid file live in
+`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. **No bootstrap token is written to disk.**
+
+`herdr-auth-proxy wrap` starts the proxy, receives a process-scoped bootstrap
+token from it over a pipe, and sets that token as `HERDR_AUTH_JWT` in the herdr
+process environment. Herdr passes that environment to every shell it spawns, so
+`herdr-auth-proxy mint` and `herdr-auth token mint` work from any shell. The
+bootstrap token is **orchestrator-scoped**: it can mint agent or orchestrator
+tokens, but never admin tokens. `--cwd` and `--workspace` are required when
+minting an orchestrator token.
 
 ```bash
-herdr-auth-proxy mint --role orchestrator --sub orch \
+herdr-auth-proxy wrap -- herdr
+
+# In a shell pane created by herdr (it inherits HERDR_AUTH_JWT):
+herdr-auth-proxy mint --role orchestrator --sub orch --cwd /work --workspace w1 \
   --perm '{"agent_grants":["report_status","read_own_pane"],"agent_kinds":["opencode"]}'
 ```
+
+Pane-bound agent tokens can only be minted for a pane the minter owns; the
+bootstrap token owns no panes. Use `auth.agent.spawn` (or an orchestrator token)
+to create/bind agent tokens.
+
+`mint` uses `HERDR_AUTH_JWT` from its environment. Because every shell inherits
+the bootstrap token, any command in a user shell can mint agent/orchestrator
+tokens; that is the trade-off of the env-based design. The herdr **server** must
+be started through `wrap` (or restarted under it) so it inherits the token; a
+server already running without it will not have the bootstrap token. The
+bootstrap token is visible through `/proc/<pid>/environ` to same-uid processes.
+**Restarting the
+proxy invalidates every token**, so re-mint after a restart. Any `keys/`
+directory left by an older version is now ignored and may be deleted.
+
+Panes created by `auth.agent.spawn` get a freshly minted **agent** token in
+their pane environment, overriding the inherited bootstrap token. Panes created
+directly in the herdr TUI (outside the proxy) keep the bootstrap token, so the
+sandbox wrapper must reject non-agent tokens and must not be run in such a pane
+with the inherited token.
+
+`--cwd` and `--workspace` are the token's only working directory and workspace.
+Panes and agents created with that token are always opened there; callers
+cannot override either value.
+
+## Minting requirements
+
+Role minting is fixed; it is not configurable through a mutable `mint_roles`
+list.
+
+| Minter token | May mint | Notes |
+|---|---|---|
+| **bootstrap** (`wrap`) | `agent`, `orchestrator` | never `admin`; orchestrator requires `cwd` **and** `workspace_id` |
+| **orchestrator** | `agent` only | grants must be a subset of its `agent_grants`; `cwd`/`workspace_id` are inherited |
+| **agent** | nothing | cannot mint |
+| **admin** | any | reserved; not issued by bootstrap |
+
+Additional rules:
+
+- `--cwd` is required for orchestrator tokens and must be an existing absolute
+  directory. `--workspace` is required and must be non-empty.
+- Agent tokens inherit the minter's `cwd`/`workspace_id`; they cannot change
+  them. Agent tokens may omit `cwd`/`workspace_id` when the minter is the
+  bootstrap token.
+- `--pane` is valid only for agent tokens, and only if the minter owns that
+  pane. The bootstrap token owns no panes, so pane-bound agent tokens come from
+  `auth.agent.spawn` or an orchestrator that owns the pane.
+- `--sub` is a label suffix only. The token `sub` is always derived as
+  `minter:jti[:label]`; a caller cannot choose a bare `sub` or impersonate
+  another owner.
+- `perm.agent_grants` is intersected with the global grantable set and the
+  minter's grants. `perm.agent_kinds` can only narrow the global sandboxed kind
+  list (`opencode`); it cannot widen it. `perm.mint_max_ttl_s` caps child TTL.
+  `mint_roles` no longer exists.
+- Child `exp` is clamped to the minter's `exp` and its `mint_max_ttl_s`. Agent
+  tokens default to 24 h; orchestrator tokens have no default expiry unless
+  `--ttl_s` is supplied.
+- `herdr-auth-proxy mint` defaults to `--role orchestrator`.
+  `herdr-auth token mint` defaults to `--role agent`.
 
 ## `herdr-auth` CLI
 
@@ -99,9 +171,11 @@ export HERDR_AUTH_JWT=...            # orchestrator token (or --token-file)
 
 herdr-auth whoami
 herdr-auth methods
-herdr-auth agent spawn --kind opencode --cwd /work/foo --label foo \
+herdr-auth agent spawn --kind opencode --label foo \
   --grant report_status --grant read_own_pane -- --model sonnet
+# pane-bound mint requires the caller to own w1:p2:
 herdr-auth token mint --role agent --pane w1:p2 --grant report_status
+# optional: --cwd/--workspace must match the caller token, they cannot change it
 herdr-auth call agent.list --params '{}'
 ```
 
@@ -127,6 +201,51 @@ herdr server ── herdr.sock (real, private) ── herdr-auth-proxy ── au
 
 All client traffic connects only to the proxy; herdr's real socket stays unreachable
 for sandboxed identities.
+
+## Sandbox wrapper requirements
+
+The proxy cannot enforce the sandbox from the outside. The deployment's `bwrap`
+wrapper must, in the sandbox's mount namespace:
+
+1. **Always bind `/dev/null` over every real herdr socket.** Do this even if the
+   herdr config directory is already hidden — it is defense in depth:
+   - `herdr.sock`
+   - `herdr-client.sock`
+   - the active session socket and its `-client` sibling
+     (`.../sessions/<name>/herdr.sock` and `.../herdr-client.sock`)
+   - the default `$XDG_CONFIG_HOME/herdr/herdr.sock` and `herdr-client.sock`
+   - any custom `HERDR_SOCKET_PATH` inherited by the pane and its `-client`
+     sibling
+
+   Example:
+   ```sh
+   --bind /dev/null "$HERDR_CONFIG/herdr.sock" \
+   --bind /dev/null "$HERDR_CONFIG/herdr-client.sock" \
+   --bind /dev/null "$HERDR_SESSION_DIR/herdr.sock" \
+   --bind /dev/null "$HERDR_SESSION_DIR/herdr-client.sock"
+   ```
+   A bind-mounted `/dev/null` is not a socket: `connect()` fails even if the path
+   is visible, so a stray bind or a forgotten hide cannot bypass the proxy.
+
+2. Bind **only the proxy's `auth.sock`** from the runtime dir. Do not bind the
+   whole runtime directory.
+3. Use a **private PID namespace and `/proc`** (`--unshare-pid --proc /proc`).
+   Without it, the agent can read `/proc/<pid>/environ` and obtain the inherited
+   bootstrap orchestrator token from herdr or other same-uid processes, even
+   though its own pane was given a minted agent token.
+4. Set `HERDR_SOCKET_PATH` to the sandboxed `auth.sock` path and pass
+   `HERDR_AUTH_JWT` through. Strip the real socket path and all other inherited
+   `HERDR_*` variables.
+5. Validate agent arguments (the proxy only whitelists the `kind`), refuse
+   path-changing flags such as `--cwd`, and set the agent's cwd to the token's
+   `cwd` claim (see ARCHITECTURE §4.3).
+6. Never fall back to herdr's original `HERDR_SOCKET_PATH` if anything fails;
+   abort instead.
+
+Orchestrators are not allowed to create plain panes: `pane.split`, `tab.create`
+and `agent.start` are denied. Every orchestrator-created pane goes through
+`auth.agent.spawn`, which injects the token/cwd/env and starts the wrapper in
+one operation.
 
 ## Development
 

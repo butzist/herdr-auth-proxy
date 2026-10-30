@@ -114,11 +114,16 @@ pub const KNOWN_METHODS: &[&str] = &[
 ];
 
 /// Minimal orchestrator workflow (default-deny everything else).
+/// Agent kinds that have a sandbox wrapper. A token's `agent_kinds` may narrow
+/// this list but never widen it: any other kind would run unsandboxed.
+pub const SANDBOXED_AGENT_KINDS: &[&str] = &["opencode"];
+
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "ping",
-    // create (owned)
-    "pane.split",
-    "tab.create",
+    // The only way an orchestrator may create a pane/start an agent is the
+    // atomic auth.agent.spawn (proxy env/cwd/token authority). Direct
+    // pane.split/tab.create/agent.start are intentionally denied: they create
+    // or use plain shells that run arbitrary code as the herdr user.
     // read (owned only / filtered)
     "pane.list",
     "pane.get",
@@ -132,7 +137,6 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     // control (owned)
     "tab.close",
     "pane.close",
-    "agent.start",
     "agent.prompt",
     // proxy extensions
     "auth.whoami",
@@ -172,19 +176,36 @@ pub fn tab_id_param(params: &Value) -> Option<&str> {
 }
 
 /// Agent targets are either a pane id (`w1:p2`) or an agent name.
+///
+/// herdr's agent methods use `target`; older/other shapes use `agent`.
 pub fn agent_target_pane(params: &Value) -> Option<&str> {
     params
-        .get("agent")
+        .get("target")
+        .or_else(|| params.get("agent"))
         .and_then(Value::as_str)
         .filter(|value| value.contains(':'))
 }
 
+pub fn agent_target(params: &Value) -> Option<&str> {
+    params
+        .get("target")
+        .or_else(|| params.get("agent"))
+        .and_then(Value::as_str)
+}
+
 /// Record ids returned by creation methods.
-pub fn record_created(method: &str, result: &Value, state: &mut State, sub: &str, jti: &str) {
+pub fn record_created(
+    method: &str,
+    result: &Value,
+    state: &mut State,
+    sub: &str,
+    jti: &str,
+    cwd: Option<&str>,
+) {
     match method {
         "pane.split" => {
             if let Some(pane) = result.pointer("/pane/pane_id").and_then(Value::as_str) {
-                state.record_pane(pane, sub, Some(jti));
+                state.record_pane(pane, sub, Some(jti), cwd);
             }
         }
         "tab.create" => {
@@ -192,7 +213,7 @@ pub fn record_created(method: &str, result: &Value, state: &mut State, sub: &str
                 state.record_tab(tab, sub);
             }
             if let Some(pane) = result.pointer("/root_pane/pane_id").and_then(Value::as_str) {
-                state.record_pane(pane, sub, Some(jti));
+                state.record_pane(pane, sub, Some(jti), cwd);
             }
         }
         _ => {}
@@ -246,8 +267,10 @@ mod tests {
 
     #[test]
     fn orchestrator_allowlist_is_minimal() {
-        assert!(allowed(Role::Orchestrator, "pane.split"));
-        assert!(allowed(Role::Orchestrator, "agent.start"));
+        assert!(allowed(Role::Orchestrator, "auth.agent.spawn"));
+        assert!(!allowed(Role::Orchestrator, "pane.split"));
+        assert!(!allowed(Role::Orchestrator, "tab.create"));
+        assert!(!allowed(Role::Orchestrator, "agent.start"));
         assert!(!allowed(Role::Orchestrator, "pane.send_text"));
         assert!(!allowed(Role::Orchestrator, "layout.apply"));
         assert!(!allowed(Role::Orchestrator, "events.subscribe"));
@@ -265,9 +288,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_targets_use_target_field() {
+        assert_eq!(
+            agent_target_pane(&json!({"target": "w1:p2"})),
+            Some("w1:p2")
+        );
+        assert_eq!(agent_target(&json!({"target": "alice"})), Some("alice"));
+        assert_eq!(agent_target_pane(&json!({"target": "alice"})), None);
+    }
+
+    #[test]
     fn list_filtering_keeps_owned_only() {
         let mut state = State::default();
-        state.record_pane("w1:p1", "alice", None);
+        state.record_pane("w1:p1", "alice", None, None);
         let mut result = json!({"panes": [
             {"pane_id": "w1:p1"},
             {"pane_id": "w1:p2"}
@@ -287,8 +320,10 @@ mod tests {
             &mut state,
             "alice",
             "j1",
+            Some("/work"),
         );
         assert!(state.owns_tab("w1:t2", "alice"));
         assert!(state.owns_pane("w1:p3", "alice"));
+        assert_eq!(state.pane_cwd("w1:p3"), Some("/work"));
     }
 }
