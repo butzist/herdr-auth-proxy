@@ -1,0 +1,11 @@
+target/
+__pycache__/
+*.pyc
+*.log
+
+# Local direnv/devshell state
+.direnv/
+.envrc
+
+# Per-project jailed-agent home
+.home/
