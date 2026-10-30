@@ -37,8 +37,6 @@ pub struct Paths {
     pub state_dir: PathBuf,
     pub auth_socket: PathBuf,
     pub upstream_socket: PathBuf,
-    pub key_file: PathBuf,
-    pub pub_file: PathBuf,
     pub state_file: PathBuf,
     pub pid_file: PathBuf,
     pub log_file: PathBuf,
@@ -118,8 +116,6 @@ pub fn load() -> Result<(Config, Paths), String> {
     };
 
     let paths = Paths {
-        key_file: config_dir.join("keys").join("ed25519.key"),
-        pub_file: config_dir.join("keys").join("ed25519.pub"),
         state_file: state_dir.join("state.json"),
         pid_file: runtime.join("proxy.pid"),
         log_file: state_dir.join("proxy.log"),

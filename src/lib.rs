@@ -2,6 +2,7 @@
 //! herdr's JSON API socket. See ARCHITECTURE.md.
 
 pub mod config;
+pub mod cwd;
 pub mod environ;
 pub mod grants;
 pub mod jwt;

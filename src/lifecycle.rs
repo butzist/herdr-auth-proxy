@@ -1,15 +1,22 @@
 //! Lifecycle helpers: start detached, wrap the herdr command, stop, status.
 
+use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::config::Paths;
 
-pub fn ensure_running(paths: &Paths) -> Result<(), String> {
+/// Ensure the proxy is running.
+///
+/// If this call starts a new proxy, returns the process-scoped bootstrap token
+/// that `wrap` must place in the herdr process's `HERDR_AUTH_JWT` environment
+/// variable. If the proxy was already running, returns `None`.
+pub fn ensure_running(paths: &Paths) -> Result<Option<String>, String> {
     if socket_alive(&paths.auth_socket) {
-        return Ok(());
+        return Ok(None);
     }
     if let Some(parent) = paths.auth_socket.parent() {
         std::fs::create_dir_all(parent)
@@ -31,8 +38,9 @@ pub fn ensure_running(paths: &Paths) -> Result<(), String> {
     let mut command = Command::new(exe);
     command
         .arg("serve")
+        .env("HERDR_AUTH_BOOTSTRAP_STDOUT", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     unsafe {
         command.pre_exec(|| {
@@ -42,13 +50,50 @@ pub fn ensure_running(paths: &Paths) -> Result<(), String> {
             Ok(())
         });
     }
-    command
+    let mut child = command
         .spawn()
         .map_err(|error| format!("spawn proxy: {error}"))?;
 
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "proxy has no stdout pipe".to_string())?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())
+            .map(|read| {
+                if read == 0 {
+                    String::new()
+                } else {
+                    line.trim().to_owned()
+                }
+            });
+        let _ = tx.send(result);
+    });
+    let token = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(token)) if !token.is_empty() => token,
+        Ok(Ok(_)) => {
+            return Err(format!(
+                "proxy did not send a bootstrap token (see {})",
+                paths.log_file.display()
+            ));
+        }
+        Ok(Err(error)) => return Err(format!("read bootstrap token: {error}")),
+        Err(_) => {
+            return Err(format!(
+                "timed out waiting for the proxy bootstrap token (see {})",
+                paths.log_file.display()
+            ));
+        }
+    };
+
     for _ in 0..100 {
         if socket_alive(&paths.auth_socket) {
-            return Ok(());
+            return Ok(Some(token));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -64,9 +109,14 @@ pub fn wrap(command: &[String]) -> Result<(), String> {
         return Err("usage: herdr-auth-proxy wrap -- <command> [args...]".into());
     }
     let (_, paths) = crate::config::load()?;
-    ensure_running(&paths)?;
+    let bootstrap = ensure_running(&paths)?;
 
-    let error = Command::new(&command[0]).args(&command[1..]).exec();
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    if let Some(token) = bootstrap {
+        child.env("HERDR_AUTH_JWT", token);
+    }
+    let error = child.exec();
     Err(format!("exec {}: {error}", command[0]))
 }
 
