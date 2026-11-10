@@ -64,7 +64,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] Method registry (103 herdr methods, protocol 22) embedded
 - [x] Explicit role allowlists (default-deny; no danger-class wildcards)
 - [x] Param guards: agent `pane_id`/`target` forcing and ownership; pane-bound
-      minting requires an owned pane; `auth.agent.spawn` kind is globally capped
+      minting requires an owned pane except for the operator (bootstrap) token;
+      `auth.agent.spawn` kind is globally capped
       to `opencode` (args passed through); `layout.apply` denied; **env
       authority** for the atomic spawn path; **cwd/workspace authority**: token
       `cwd` and `workspace_id` are the only directory/workspace for spawn,
@@ -100,6 +101,10 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
       minter's `agent_grants`; the orchestrator ceiling defaults to the full
       advertised set, agent tokens default to `["report_status"]`; over-request
       → `grant_not_allowed`
+- [x] Bootstrap operator may bind an agent token to an existing pane without
+      ownership transfer; other non-admin minters remain owned-only
+- [x] `wait_own_output` covers own-pane output waits and own-agent lifecycle
+      waits; orchestrators may wait for output on owned panes
 
 ## Phase 7 — pane ownership
 
@@ -130,8 +135,12 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] `herdr-auth` client CLI: `call <method> --json`, `agent spawn`,
       `token mint`, `whoami`, `methods`; JWT via `--token`/`--token-file`/
       `$HERDR_AUTH_JWT` (auth.hello first line) or env fallback
+- [x] `herdr-agent` convenience CLI: `spawn` + `prompt`; prompt text comes from
+      `--text`, `--text-file`, or stdin (verbatim, no JSON escaping), waits for
+      idle by default (900 s, `--no-wait` opt-out), and sizes the socket timeout
+      to `wait + 60 s`
 - [x] Grantable-capability validation in the CLI (`--grant`, 4 capabilities)
-- [x] Nix packaging: `packages.default` (both binaries), `apps`, `overlays`,
+- [x] Nix packaging: `packages.default` (all binaries), `apps`, `overlays`,
       `nixosModules.default`, `homeManagerModules.default`, `formatter`;
       verified with `nix build .#`
 - [ ] README quick-start: install → bootstrap orchestrator token → spawn gated
@@ -144,7 +153,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] Live-testing hardening: `max_token_ttl_s` hard cap for requested TTLs;
       reject `perm` on agent tokens and `grants` on non-agent tokens; agent
       reports reject foreign panes, pin `agent`/`source`, and reject
-      `resume_argv`; CLI flags override inherited `HERDR_AUTH_JWT`
+      `resume_argv`; CLI flags override inherited `HERDR_AUTH_JWT`; bootstrap
+      operator pane binding; own-pane/own-agent wait paths
 - [x] Fake-upstream smoke test: hello + environ auth, admin/orchestrator/agent
       personas, owned-only list, pane forcing, atomic spawn, wrap/stop/status
 - [ ] Integration test against a real herdr (nix-provided) covering both personas

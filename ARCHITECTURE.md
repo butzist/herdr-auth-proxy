@@ -160,7 +160,8 @@ Binaries:
 | Binary | Role |
 |---|---|
 | `herdr-auth-proxy` | session management only: `serve` (default), `wrap`, `stop`, `status`. |
-| `herdr-auth` | client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`. |
+| `herdr-auth` | generic client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`. |
+| `herdr-agent` | focused orchestrator client: `spawn` (same atomic extension as `herdr-auth agent spawn`) and `prompt` (plain text from `--text`, `--text-file`, or stdin; no JSON escaping). |
 | `herdr-auth-launch` | *deferred / optional later feature*: client helper (exec + relay modes) for deployments without a sandbox wrapper (§11). |
 
 ## 4. Authentication design
@@ -209,8 +210,12 @@ Binaries:
 - Minting rules:
   - `cwd` and `workspace_id` are required for bootstrap-minted orchestrator
     tokens; orchestrators inherit both and cannot change them.
-  - `pane_id` is valid only for agent tokens and only if the minter owns the
-    pane. Bootstrap owns no panes; use `auth.agent.spawn` for bound agents.
+  - `pane_id` is valid only for agent tokens. A non-bootstrap minter must own
+    the pane. The bootstrap token is the operator and may bind an agent token
+    to any existing pane (it owns no TUI-created panes itself), without
+    transferring ownership; the agent reaches the pane only through its
+    `pane_id` claim and declared grants. `auth.agent.spawn` remains the path
+    that creates and owns a new pane.
   - child `sub` is always `minter:jti[:label]`; a caller cannot choose a bare
     `sub` or impersonate another owner.
   - `perm.agent_kinds` may only narrow the global sandboxed list (`opencode`);
@@ -339,8 +344,8 @@ call, with token binding and failure cleanup (§7.1). Direct `pane.split`,
 
 | Persona | Token | Allowed herdr methods (default) |
 |---|---|---|
-| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` must equal the claim; `agent`/`source` pinned to `opencode`); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output` (own pane). Default: `["report_status"]`. Exactly covers the opencode plugin. |
-| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including direct `pane.split`, `tab.create` and `agent.start` (they create/use plain shells), `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
+| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` must equal the claim; `agent`/`source` pinned to `opencode`); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output`, `agent.wait` (own pane; `target` forced to the claim). Default: `["report_status"]`. Exactly covers the opencode plugin. |
+| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `pane.wait_for_output`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including direct `pane.split`, `tab.create` and `agent.start` (they create/use plain shells), `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
 | **admin** (reserved) | role=admin | All methods + `auth.*`; not issued by the default bootstrap (the bootstrap token is orchestrator-scoped and cannot mint admin). |
 
 **Grantable agent capabilities.** An orchestrator may grant only a subset of
@@ -355,7 +360,7 @@ explicit `perm.agent_grants` narrows it. Agent tokens default to
 | `report_status` | `pane.report_agent`, `pane.report_agent_session` (pane forced to the claim) |
 | `report_metadata` | `pane.report_metadata` |
 | `read_own_pane` | `pane.get`, `pane.read`, `agent.get` |
-| `wait_own_output` | `pane.wait_for_output` |
+| `wait_own_output` | `pane.wait_for_output`, `agent.wait` (target forced to the claim) |
 
 **Default-deny.** The orchestrator allowlist is exhaustive for the current
 orchestrator/developer/reviewer workflow; everything else is denied until
@@ -485,8 +490,10 @@ cleanup path.
 
 1. **`herdr-auth` CLI** (shipped with the proxy): `herdr-auth agent spawn --kind
    opencode --cwd … -- <args>`; generic `herdr-auth call auth.agent.spawn --json
-   '{…}'`; `herdr-auth token mint …`. Auth via `HERDR_AUTH_JWT` in its env
-   (peer-environ mode) or `--token`.
+   '{…}'`; `herdr-auth token mint …`. The focused **`herdr-agent`** CLI wraps
+   `spawn` and `agent.prompt`; prompt text is read verbatim from `--text`,
+   `--text-file`, or stdin instead of being embedded in a JSON params argument.
+   Auth via `HERDR_AUTH_JWT` in its env (peer-environ mode) or `--token`.
 2. **Raw NDJSON** with any tool, e.g. `printf '%s\n' '{"id":"1","method":
    "auth.agent.spawn","params":{…}}' | socat - UNIX-CONNECT:<auth.sock>` (the
    connecting process must carry `HERDR_AUTH_JWT`, or send `auth.hello` first).
@@ -516,6 +523,10 @@ cleanup path.
 - Enforcement: every pane-targeting request validates `pane_id` against the
   caller's owned set (orchestrator); agent-role requests are pinned to their own
   `pane_id` claim; list/snapshot responses are filtered to owned ids.
+- Bootstrap minting is the one exemption: the operator may bind an agent token
+  to an existing pane it does not own, but ownership is **not** transferred.
+  Non-bootstrap orchestrators must own the pane. The agent still reaches only
+  that pane and only through its declared grants.
 - Optional mirror into herdr for visibility: proxy calls `pane.report_metadata`
   (source `auth-proxy`) with `auth_owner=<sub>`, `auth_jti=<jti>` tokens (80-char
   limit is fine for references, not for JWTs — §2.5). Display only.
@@ -564,7 +575,7 @@ The signing key is never persisted. State lives in
 `$XDG_STATE_HOME/herdr-auth-proxy/`; the auth socket and pid file live in
 `$XDG_RUNTIME_DIR/herdr-auth-proxy/`. There is no bootstrap-token file.
 
-Packaging: `packages.default` builds both binaries;
+Packaging: `packages.default` builds all binaries;
 `nixosModules.default` (opt-in `programs.herdr-auth-proxy.enable`) and
 `homeManagerModules.default` only add the package — no service, by design.
 
@@ -619,7 +630,9 @@ Decided in review:
   environment cannot be changed externally). No file is written. `herdr-auth
   token mint` uses that environment token to mint agent or
   orchestrator tokens (an orchestrator token requires both `cwd` and
-  `workspace_id`), but **cannot mint admin**.
+  `workspace_id`), but **cannot mint admin**. As the operator token it may also
+  bind an agent token to an existing pane it does not own, without transferring
+  pane ownership.
   The signing key stays in memory, so a proxy restart invalidates all tokens. The
   proxy **cannot** verify that a client is the operator (uid is shared, bwrap
   keeps the herdr uid); the bootstrap token being confined to herdr's process

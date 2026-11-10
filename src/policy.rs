@@ -128,6 +128,7 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "pane.list",
     "pane.get",
     "pane.read",
+    "pane.wait_for_output",
     "tab.list",
     "tab.get",
     "agent.list",
@@ -268,6 +269,7 @@ mod tests {
     #[test]
     fn orchestrator_allowlist_is_minimal() {
         assert!(allowed(Role::Orchestrator, "auth.agent.spawn"));
+        assert!(allowed(Role::Orchestrator, "pane.wait_for_output"));
         assert!(!allowed(Role::Orchestrator, "pane.split"));
         assert!(!allowed(Role::Orchestrator, "tab.create"));
         assert!(!allowed(Role::Orchestrator, "agent.start"));

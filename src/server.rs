@@ -331,7 +331,7 @@ fn enforce_agent_params(
         params["pane_id"] = json!(pane);
     }
 
-    if method == "agent.get" {
+    if matches!(method, "agent.get" | "agent.wait") {
         if let Some(requested) = policy::agent_target_pane(params)
             && requested != pane
         {
@@ -818,8 +818,13 @@ async fn mint(
     }
     let is_bootstrap = identity.jti == ctx.bootstrap_jti;
 
+    // The bootstrap token is the operator: it may hand an agent token to an
+    // existing pane even though bootstrap owns no TUI-created panes. Every
+    // other non-admin minter must already own the pane. Ownership stays with
+    // the operator; the agent reaches the pane through its `pane_id` claim.
     if let Some(pane) = &pane_id
         && identity.role != Role::Admin
+        && !is_bootstrap
     {
         let state = ctx.state.lock().await;
         if !state.owns_pane(pane, &identity.sub) {
@@ -1364,6 +1369,20 @@ mod tests {
         }
     }
 
+    fn orchestrator_identity() -> Identity {
+        Identity {
+            sub: "orch".into(),
+            role: Role::Orchestrator,
+            grants: Vec::new(),
+            perm: None,
+            pane_id: None,
+            cwd: None,
+            workspace_id: None,
+            jti: "orch-jti".into(),
+            exp: None,
+        }
+    }
+
     fn agent_identity(pane: &str) -> Identity {
         Identity {
             sub: "orch:agent".into(),
@@ -1477,6 +1496,46 @@ mod tests {
             .unwrap();
             assert_eq!(result["role"], json!("agent"));
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_may_bind_an_agent_token_to_an_unowned_pane() {
+        let ctx = test_ctx();
+        let identity = bootstrap_identity();
+        let result = mint(
+            &ctx,
+            &identity,
+            &json!({"role": "agent", "pane_id": "w1:p99", "grants": ["wait_own_output"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["role"], json!("agent"));
+    }
+
+    #[tokio::test]
+    async fn non_bootstrap_orchestrator_cannot_bind_an_unowned_pane() {
+        let ctx = test_ctx();
+        let identity = orchestrator_identity();
+        let (code, _) = mint(
+            &ctx,
+            &identity,
+            &json!({"role": "agent", "pane_id": "w1:p99"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, "forbidden");
+    }
+
+    #[test]
+    fn agent_wait_target_is_forced_to_the_claim() {
+        let identity = agent_identity("w1:p8");
+        let mut params = json!({"target": "w1:p9"});
+        let (code, _) = enforce_agent_params(&identity, "agent.wait", &mut params).unwrap_err();
+        assert_eq!(code, "forbidden");
+
+        let mut params = json!({});
+        enforce_agent_params(&identity, "agent.wait", &mut params).unwrap();
+        assert_eq!(params["target"], json!("w1:p8"));
     }
 
     #[test]

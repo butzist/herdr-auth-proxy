@@ -13,15 +13,13 @@
 //! (peer-environ mode).
 
 use std::fs;
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
-use herdr_auth_proxy::config;
-use herdr_auth_proxy::grants::GRANTABLE_AGENT_CAPABILITIES;
+use herdr_auth_proxy::client;
+use herdr_auth_proxy::grants;
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Parser)]
@@ -162,27 +160,18 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), String> {
     let (method, params) = build_request(&cli.command)?;
     let token = resolve_token(&cli)?;
-    let socket = cli.socket.clone().unwrap_or_else(|| {
-        config::load()
-            .map(|(_, paths)| paths.auth_socket)
-            .unwrap_or_else(|_| PathBuf::from("/run/herdr-auth-proxy/auth.sock"))
-    });
-    let response = exchange(&socket, token.as_deref(), &method, params, cli.timeout_ms)?;
+    let socket = cli.socket.clone().unwrap_or_else(client::default_socket);
+    let response = client::exchange(&socket, token.as_deref(), &method, params, cli.timeout_ms)?;
 
     if cli.raw {
         println!("{response}");
     }
 
-    let value: Value = serde_json::from_str(&response)
-        .map_err(|error| format!("invalid response from proxy: {error}"))?;
-    if let Some(error) = value.get("error") {
-        return Err(format_error(error));
-    }
+    let result = client::response_result(&response)?;
     if cli.raw {
         return Ok(());
     }
 
-    let result = value.get("result").cloned().unwrap_or(Value::Null);
     let rendered = if cli.pretty {
         serde_json::to_string_pretty(&result)
     } else {
@@ -218,7 +207,7 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
                     perm,
                 },
         } => {
-            validate_grants(grants)?;
+            grants::validate(grants)?;
             let mut params = Map::new();
             params.insert("role".into(), json!(role));
             if let Some(sub) = sub {
@@ -240,7 +229,7 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
                 params.insert("grants".into(), json!(grants));
             }
             if let Some(perm) = perm {
-                params.insert("perm".into(), parse_json(perm, "--perm")?);
+                params.insert("perm".into(), client::parse_json_object(perm, "--perm")?);
             }
             Ok(("auth.token.mint".into(), Value::Object(params)))
         }
@@ -258,39 +247,25 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
                     args,
                 },
         } => {
-            validate_grants(grants)?;
-            let mut params = Map::new();
-            params.insert("kind".into(), json!(kind));
-            if !args.is_empty() {
-                params.insert("args".into(), json!(args));
-            }
-            if let Some(name) = name {
-                params.insert("name".into(), json!(name));
-            }
-            if let Some(cwd) = cwd {
-                params.insert("cwd".into(), json!(cwd));
-            }
-            if let Some(workspace) = workspace {
-                params.insert("workspace_id".into(), json!(workspace));
-            }
-            if let Some(label) = label {
-                params.insert("label".into(), json!(label));
-            }
-            params.insert("focus".into(), json!(focus));
-            if let Some(ttl_s) = ttl_s {
-                params.insert("ttl_s".into(), json!(ttl_s));
-            }
-            if !grants.is_empty() {
-                params.insert("grants".into(), json!(grants));
-            }
-            Ok(("auth.agent.spawn".into(), Value::Object(params)))
+            let params = client::spawn_params(
+                kind,
+                args,
+                name.as_deref(),
+                cwd.as_deref(),
+                workspace.as_deref(),
+                label.as_deref(),
+                *focus,
+                *ttl_s,
+                grants,
+            )?;
+            Ok(("auth.agent.spawn".into(), params))
         }
     }
 }
 
 fn resolve_params(inline: Option<&str>, file: Option<&Path>) -> Result<Value, String> {
     if let Some(inline) = inline {
-        return parse_json(inline, "--params");
+        return client::parse_json_object(inline, "--params");
     }
     if let Some(path) = file {
         if path == Path::new("-") {
@@ -298,7 +273,7 @@ fn resolve_params(inline: Option<&str>, file: Option<&Path>) -> Result<Value, St
         }
         let text = fs::read_to_string(path)
             .map_err(|error| format!("read {}: {error}", path.display()))?;
-        return parse_json(&text, &path.display().to_string());
+        return client::parse_json_object(&text, &path.display().to_string());
     }
     if io::stdin().is_terminal() {
         return Ok(json!({}));
@@ -314,152 +289,16 @@ fn read_stdin_json() -> Result<Value, String> {
     if text.trim().is_empty() {
         return Ok(json!({}));
     }
-    parse_json(&text, "stdin")
-}
-
-fn parse_json(text: &str, source: &str) -> Result<Value, String> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| format!("invalid JSON from {source}: {error}"))?;
-    if !value.is_object() {
-        return Err(format!("{source} must contain a JSON object"));
-    }
-    Ok(value)
+    client::parse_json_object(&text, "stdin")
 }
 
 fn resolve_token(cli: &Cli) -> Result<Option<String>, String> {
     let env_token = std::env::var("HERDR_AUTH_JWT").ok();
-    resolve_token_from(
+    client::resolve_token_from(
         cli.token.as_deref(),
         cli.token_file.as_deref(),
         env_token.as_deref(),
     )
-}
-
-/// Explicit flags win over the inherited environment: `HERDR_AUTH_JWT` must not
-/// silently turn a `--token`/`--token-file` test into an orchestrator call.
-fn resolve_token_from(
-    token: Option<&str>,
-    token_file: Option<&Path>,
-    env_token: Option<&str>,
-) -> Result<Option<String>, String> {
-    if let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) {
-        return Ok(Some(token.to_owned()));
-    }
-    if let Some(path) = token_file {
-        let token = fs::read_to_string(path)
-            .map_err(|error| format!("read token file {}: {error}", path.display()))?;
-        let token = token.trim();
-        if token.is_empty() {
-            return Err(format!("token file {} is empty", path.display()));
-        }
-        return Ok(Some(token.to_owned()));
-    }
-    if let Some(token) = env_token.map(str::trim).filter(|token| !token.is_empty()) {
-        return Ok(Some(token.to_owned()));
-    }
-    Ok(None)
-}
-
-fn exchange(
-    socket: &Path,
-    token: Option<&str>,
-    method: &str,
-    params: Value,
-    timeout_ms: u64,
-) -> Result<String, String> {
-    let stream = UnixStream::connect(socket)
-        .map_err(|error| format!("connect {}: {error}", socket.display()))?;
-    let timeout = Duration::from_millis(timeout_ms);
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("set read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("set write timeout: {error}"))?;
-
-    let mut writer = stream
-        .try_clone()
-        .map_err(|error| format!("clone socket: {error}"))?;
-    let mut reader = BufReader::new(stream);
-
-    if let Some(jwt) = token {
-        let hello = json!({
-            "id": request_id("hello"),
-            "method": "auth.hello",
-            "params": { "jwt": jwt },
-        });
-        write_line(&mut writer, &hello)?;
-        let response = read_line(&mut reader)?;
-        ensure_ok(&response, "auth.hello")?;
-    }
-
-    let request = json!({
-        "id": request_id("cli"),
-        "method": method,
-        "params": params,
-    });
-    write_line(&mut writer, &request)?;
-    read_line(&mut reader)
-}
-
-fn write_line(writer: &mut impl Write, value: &Value) -> Result<(), String> {
-    let mut line = serde_json::to_vec(value).map_err(|error| format!("encode request: {error}"))?;
-    line.push(b'\n');
-    writer
-        .write_all(&line)
-        .map_err(|error| format!("write request: {error}"))?;
-    writer
-        .flush()
-        .map_err(|error| format!("flush request: {error}"))
-}
-
-fn read_line(reader: &mut impl BufRead) -> Result<String, String> {
-    let mut line = String::new();
-    let read = reader
-        .read_line(&mut line)
-        .map_err(|error| format!("read response: {error}"))?;
-    if read == 0 {
-        return Err("proxy closed the connection without a response".into());
-    }
-    Ok(line.trim_end().to_owned())
-}
-
-fn ensure_ok(response: &str, what: &str) -> Result<(), String> {
-    let value: Value = serde_json::from_str(response)
-        .map_err(|error| format!("invalid {what} response: {error}"))?;
-    if let Some(error) = value.get("error") {
-        return Err(format!("{what}: {}", format_error(error)));
-    }
-    Ok(())
-}
-
-fn format_error(error: &Value) -> String {
-    let code = error.get("code").and_then(Value::as_str).unwrap_or("error");
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("request failed");
-    format!("{message} ({code})")
-}
-
-fn request_id(prefix: &str) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{prefix}-{}-{nanos}", std::process::id())
-}
-
-fn validate_grants(grants: &[String]) -> Result<(), String> {
-    for grant in grants {
-        if !GRANTABLE_AGENT_CAPABILITIES.contains(&grant.as_str()) {
-            return Err(format!(
-                "unknown grant `{grant}` (allowed: {})",
-                GRANTABLE_AGENT_CAPABILITIES.join(", ")
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -515,43 +354,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_token_beats_environment() {
-        let resolved = resolve_token_from(Some("flag"), None, Some("env")).unwrap();
-        assert_eq!(resolved.as_deref(), Some("flag"));
-    }
-
-    #[test]
-    fn explicit_token_file_beats_environment() {
-        let path = std::env::temp_dir().join(format!("hap-token-{}", request_id("test")));
-        std::fs::write(&path, "file\n").unwrap();
-        let resolved = resolve_token_from(None, Some(&path), Some("env")).unwrap();
-        assert_eq!(resolved.as_deref(), Some("file"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn environment_is_the_fallback() {
-        let resolved = resolve_token_from(None, None, Some("env")).unwrap();
-        assert_eq!(resolved.as_deref(), Some("env"));
-        assert_eq!(resolve_token_from(None, None, Some("  ")).unwrap(), None);
-    }
-
-    #[test]
     fn unknown_grant_is_rejected() {
-        let error = validate_grants(&["root".into()]).unwrap_err();
+        let error = grants::validate(&["root".into()]).unwrap_err();
         assert!(error.contains("unknown grant `root`"), "{error}");
         assert!(error.contains("report_status"), "{error}");
-    }
-
-    #[test]
-    fn params_must_be_an_object() {
-        assert!(parse_json("[]", "test").is_err());
-        assert!(parse_json("{}", "test").is_ok());
-    }
-
-    #[test]
-    fn error_is_formatted_with_code() {
-        let error = json!({"code": "forbidden", "message": "nope"});
-        assert_eq!(format_error(&error), "nope (forbidden)");
     }
 }
