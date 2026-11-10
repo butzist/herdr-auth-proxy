@@ -135,10 +135,12 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] `herdr-auth` client CLI: `call <method> --json`, `agent spawn`,
       `token mint`, `whoami`, `methods`; JWT via `--token`/`--token-file`/
       `$HERDR_AUTH_JWT` (auth.hello first line) or env fallback
-- [x] `herdr-agent` convenience CLI: `spawn` + `prompt`; prompt text comes from
-      `--text`, `--text-file`, or stdin (verbatim, no JSON escaping), waits for
-      idle by default (900 s, `--no-wait` opt-out), and sizes the socket timeout
-      to `wait + 60 s`
+- [x] `herdr-agent` convenience CLI: `spawn`, `list`, `get`, `read`, `prompt`,
+      `wait`, and `kill`; prompt text comes from `--text`, `--text-file`, or
+      stdin (verbatim, no JSON escaping), waits for idle by default (900 s,
+      `--no-wait` opt-out), and sizes the socket timeout to `wait + 60 s`.
+      `read` prints terminal text; `kill` closes the pane (`tab.close` with
+      `--tab`) after resolving names via `agent.get`
 - [x] Grantable-capability validation in the CLI (`--grant`, 4 capabilities)
 - [x] Nix packaging: `packages.default` (all binaries), `apps`, `overlays`,
       `nixosModules.default`, `homeManagerModules.default`, `formatter`;

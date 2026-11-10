@@ -205,16 +205,22 @@ herdr-auth call agent.list --params '{}'
 
 ## `herdr-agent` CLI
 
-`herdr-agent` is the ergonomic front-end for the two operations orchestrators
-use most: `spawn` and `prompt`. Unlike `herdr-auth call agent.prompt --params
-'<json>'`, prompt text is passed as **plain text** (inline, from a file, or on
-stdin), so it never has to be JSON-escaped; file/stdin input avoids shell
-quoting too.
+`herdr-agent` is the ergonomic front-end for the orchestrator workflow:
+`spawn`, `list`, `get`, `read`, `prompt`, `wait`, and `kill`. Unlike
+`herdr-auth call agent.prompt --params '<json>'`, prompt text is passed as
+**plain text** (inline, from a file, or on stdin), so it never has to be
+JSON-escaped; file/stdin input avoids shell quoting too.
 
 ```bash
 # Same atomic spawn as `herdr-auth agent spawn`.
 herdr-agent spawn --kind opencode --name worker \
   --grant report_status --grant read_own_pane -- --model sonnet
+
+# Inspect owned agents and read their terminal output.
+herdr-agent list
+herdr-agent get worker
+herdr-agent read worker --lines 200
+herdr-agent read worker --source recent-unwrapped --ansi
 
 # Prompt text from a file (verbatim, including newlines/quotes).
 herdr-agent prompt worker --text-file prompt.md
@@ -225,12 +231,26 @@ printf 'review the diff on this branch\n' | herdr-agent prompt worker
 # Inline text, or fire-and-forget without waiting for idle.
 herdr-agent prompt worker --text 'summarize the failures'
 herdr-agent prompt worker --text-file prompt.md --no-wait --pretty
+
+# Wait explicitly after a --no-wait prompt.
+herdr-agent wait worker --until idle --wait-ms 300000
+
+# Close the agent's pane, or its whole tab.
+herdr-agent kill worker
+herdr-agent kill w1:p7
+herdr-agent kill --tab worker
 ```
 
 `prompt` waits for the agent to become idle by default (`--wait-ms`, default
 900000). The socket timeout automatically becomes `wait + 60s`; pass
 `--timeout-ms` to override it. `--no-wait` submits the prompt and returns
 immediately. An empty prompt is rejected.
+
+`read` prints terminal text by default; `--pretty` or `--raw` shows the full
+JSON instead. There is no herdr `agent.kill` method: `kill` closes the agent's
+pane with `pane.close` (`tab.close` with `--tab`). Agent names are resolved via
+`agent.get` first; pane/tab ids go straight to the close call. `send-keys` is
+intentionally not exposed because raw input methods are denied to orchestrators.
 
 Start/stop together with the herdr server (no systemd unit):
 

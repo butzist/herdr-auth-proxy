@@ -161,7 +161,7 @@ Binaries:
 |---|---|
 | `herdr-auth-proxy` | session management only: `serve` (default), `wrap`, `stop`, `status`. |
 | `herdr-auth` | generic client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`. |
-| `herdr-agent` | focused orchestrator client: `spawn` (same atomic extension as `herdr-auth agent spawn`) and `prompt` (plain text from `--text`, `--text-file`, or stdin; no JSON escaping). |
+| `herdr-agent` | focused orchestrator client: `spawn` (same atomic extension as `herdr-auth agent spawn`), `list`, `get`, `read`, `prompt` (plain text from `--text`, `--text-file`, or stdin; no JSON escaping), `wait`, and `kill` (`pane.close`, or `tab.close` with `--tab`; herdr has no `agent.kill`). |
 | `herdr-auth-launch` | *deferred / optional later feature*: client helper (exec + relay modes) for deployments without a sandbox wrapper (§11). |
 
 ## 4. Authentication design
@@ -491,9 +491,11 @@ cleanup path.
 1. **`herdr-auth` CLI** (shipped with the proxy): `herdr-auth agent spawn --kind
    opencode --cwd … -- <args>`; generic `herdr-auth call auth.agent.spawn --json
    '{…}'`; `herdr-auth token mint …`. The focused **`herdr-agent`** CLI wraps
-   `spawn` and `agent.prompt`; prompt text is read verbatim from `--text`,
-   `--text-file`, or stdin instead of being embedded in a JSON params argument.
-   Auth via `HERDR_AUTH_JWT` in its env (peer-environ mode) or `--token`.
+   `spawn`, `agent.list`, `agent.get`, `agent.read`, `agent.prompt`,
+   `agent.wait`, `pane.close`, and `tab.close`; prompt text is read verbatim
+   from `--text`, `--text-file`, or stdin instead of being embedded in a JSON
+   params argument. Auth via `HERDR_AUTH_JWT` in its env (peer-environ mode) or
+   `--token`.
 2. **Raw NDJSON** with any tool, e.g. `printf '%s\n' '{"id":"1","method":
    "auth.agent.spawn","params":{…}}' | socat - UNIX-CONNECT:<auth.sock>` (the
    connecting process must carry `HERDR_AUTH_JWT`, or send `auth.hello` first).
