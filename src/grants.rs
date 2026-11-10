@@ -52,7 +52,10 @@ pub fn methods(grants: &[String]) -> Vec<&'static str> {
                 methods.push("pane.read");
                 methods.push("agent.get");
             }
-            "wait_own_output" => methods.push("pane.wait_for_output"),
+            "wait_own_output" => {
+                methods.push("pane.wait_for_output");
+                methods.push("agent.wait");
+            }
             _ => {}
         }
     }
@@ -70,6 +73,14 @@ mod tests {
         assert!(methods.contains(&"pane.report_agent_session"));
         assert!(methods.contains(&"ping"));
         assert!(!methods.contains(&"pane.read"));
+    }
+
+    #[test]
+    fn wait_own_output_covers_output_and_lifecycle_waits() {
+        let methods = methods(&["wait_own_output".into()]);
+        assert!(methods.contains(&"pane.wait_for_output"));
+        assert!(methods.contains(&"agent.wait"));
+        assert!(methods.contains(&"ping"));
     }
 
     #[test]

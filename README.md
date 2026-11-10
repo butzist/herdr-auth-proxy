@@ -46,14 +46,14 @@ need — and nothing more.
 
 **Early implementation.** The proxy core works (in-memory signing key/config/JWT,
 hello + peer-environ auth, method allowlists, ownership filtering, mint, atomic spawn,
-`wrap`/`stop`/`status`) and the `herdr-auth` CLI is complete. Validated against a
-fake upstream; not yet against a real herdr. See
+`wrap`/`stop`/`status`) and the `herdr-auth`/`herdr-agent` CLIs are complete.
+Validated against a fake upstream; not yet against a real herdr. See
 [ARCHITECTURE.md](ARCHITECTURE.md) (design, herdr findings, diagrams, decisions)
 and [TODO.md](TODO.md) (remaining work).
 
 ## Install (Nix)
 
-The flake builds both binaries (`herdr-auth-proxy`, `herdr-auth`):
+The flake builds all binaries (`herdr-auth-proxy`, `herdr-auth`, `herdr-agent`):
 
 ```nix
 # flake.nix
@@ -161,9 +161,11 @@ Additional rules:
 - Agent tokens inherit the minter's `cwd`/`workspace_id`; they cannot change
   them. Agent tokens may omit `cwd`/`workspace_id` when the minter is the
   bootstrap token.
-- `--pane` is valid only for agent tokens, and only if the minter owns that
-  pane. The bootstrap token owns no panes, so pane-bound agent tokens come from
-  `auth.agent.spawn` or an orchestrator that owns the pane.
+- `--pane` is valid only for agent tokens. A non-bootstrap minter must own that
+  pane. The bootstrap token is the operator and may bind an agent token to any
+  existing pane without transferring ownership; the agent can then use only its
+  declared grants on that pane. `auth.agent.spawn` remains the path that creates
+  and owns a new pane.
 - `--sub` is a label suffix only. The token `sub` is always derived as
   `minter:jti[:label]`; a caller cannot choose a bare `sub` or impersonate
   another owner.
@@ -201,6 +203,35 @@ herdr-auth token mint --role agent --pane w1:p2 --grant report_status
 herdr-auth call agent.list --params '{}'
 ```
 
+## `herdr-agent` CLI
+
+`herdr-agent` is the ergonomic front-end for the two operations orchestrators
+use most: `spawn` and `prompt`. Unlike `herdr-auth call agent.prompt --params
+'<json>'`, prompt text is passed as **plain text** (inline, from a file, or on
+stdin), so it never has to be JSON-escaped; file/stdin input avoids shell
+quoting too.
+
+```bash
+# Same atomic spawn as `herdr-auth agent spawn`.
+herdr-agent spawn --kind opencode --name worker \
+  --grant report_status --grant read_own_pane -- --model sonnet
+
+# Prompt text from a file (verbatim, including newlines/quotes).
+herdr-agent prompt worker --text-file prompt.md
+
+# Or stream it from stdin.
+printf 'review the diff on this branch\n' | herdr-agent prompt worker
+
+# Inline text, or fire-and-forget without waiting for idle.
+herdr-agent prompt worker --text 'summarize the failures'
+herdr-agent prompt worker --text-file prompt.md --no-wait --pretty
+```
+
+`prompt` waits for the agent to become idle by default (`--wait-ms`, default
+900000). The socket timeout automatically becomes `wait + 60s`; pass
+`--timeout-ms` to override it. `--no-wait` submits the prompt and returns
+immediately. An empty prompt is rejected.
+
 Start/stop together with the herdr server (no systemd unit):
 
 ```bash
@@ -210,7 +241,10 @@ herdr-auth-proxy stop
 ```
 
 Grantable agent capabilities: `report_status`, `report_metadata`,
-`read_own_pane`, `wait_own_output` (see ARCHITECTURE §5).
+`read_own_pane`, `wait_own_output` (see ARCHITECTURE §5). `wait_own_output`
+allows both `pane.wait_for_output` and `agent.wait` on the agent's own pane
+(`target` is forced to its pane claim). Orchestrators may also call
+`pane.wait_for_output` on panes they own.
 
 An agent token is pinned to its pane and to the `opencode` reporting identity:
 a report for another pane is rejected, and `agent`/`source` cannot be changed.
@@ -282,7 +316,7 @@ nix develop          # rust nightly + tooling
 cargo build          # build
 cargo test           # tests
 cargo clippy         # lint
-nix build .#         # package both binaries into ./result/bin
+nix build .#         # package all binaries into ./result/bin
 ```
 
 Upstream herdr facts are pinned against **herdr 0.9.5 (API protocol 22)** — see
