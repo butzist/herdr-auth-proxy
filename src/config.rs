@@ -46,8 +46,8 @@ impl Default for Config {
             agent_ttl_s: 86_400,
             max_token_ttl_s: 86_400,
             death_grace_s: 15,
-            message_poll_max_ms: 30_000,
-            message_claim_lease_s: 30,
+            message_poll_max_ms: 3_600_000,
+            message_claim_lease_s: 300,
             message_ttl_s: 86_400,
             message_max_bytes: 262_144,
             message_wakeup_after_s: 10,
@@ -165,8 +165,8 @@ mod tests {
         assert_eq!(config.agent_ttl_s, 86_400);
         assert_eq!(config.max_token_ttl_s, 86_400);
         assert_eq!(config.death_grace_s, 15);
-        assert_eq!(config.message_poll_max_ms, 30_000);
-        assert_eq!(config.message_claim_lease_s, 30);
+        assert_eq!(config.message_poll_max_ms, 3_600_000);
+        assert_eq!(config.message_claim_lease_s, 300);
         assert_eq!(config.message_max_bytes, 262_144);
     }
 }

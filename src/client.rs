@@ -70,13 +70,22 @@ pub fn exchange(
 ) -> Result<String, String> {
     let stream = UnixStream::connect(socket)
         .map_err(|error| format!("connect {}: {error}", socket.display()))?;
-    let timeout = Duration::from_millis(timeout_ms);
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("set read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("set write timeout: {error}"))?;
+    if timeout_ms > 0 {
+        let timeout = Duration::from_millis(timeout_ms);
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| format!("set read timeout: {error}"))?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|error| format!("set write timeout: {error}"))?;
+    } else {
+        stream
+            .set_read_timeout(None)
+            .map_err(|error| format!("set read timeout: {error}"))?;
+        stream
+            .set_write_timeout(None)
+            .map_err(|error| format!("set write timeout: {error}"))?;
+    }
 
     let mut writer = stream
         .try_clone()

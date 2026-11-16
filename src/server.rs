@@ -1541,11 +1541,14 @@ async fn message_poll(
     params: &Value,
 ) -> Result<Value, (String, String)> {
     let caller = caller_principal(ctx, identity).await?;
-    let wait_ms = params
-        .get("wait_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(ctx.cfg.message_poll_max_ms);
+    let requested_wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+    let capped = ctx.cfg.message_poll_max_ms > 0 && requested_wait_ms > ctx.cfg.message_poll_max_ms;
+    let wait_ms = if ctx.cfg.message_poll_max_ms == 0 {
+        requested_wait_ms
+    } else {
+        requested_wait_ms.min(ctx.cfg.message_poll_max_ms)
+    };
+    let infinite = wait_ms == 0;
     let limit = params
         .get("limit")
         .and_then(Value::as_u64)
@@ -1556,7 +1559,12 @@ async fn message_poll(
         .await
         .map_err(internal)?;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    let start = tokio::time::Instant::now();
+    let deadline = if infinite {
+        None
+    } else {
+        Some(start + Duration::from_millis(wait_ms))
+    };
     let mut rx = ctx.mail.subscribe(&caller.jti).await;
     loop {
         let now = jwt::now();
@@ -1566,22 +1574,51 @@ async fn message_poll(
             .await
             .map_err(internal)?;
         if !messages.is_empty() {
+            let claim_id = messages.first().and_then(|m| m.claim_id.clone());
+            let claim_expires_at = messages.first().and_then(|m| m.claim_expires_at);
+            let waited_ms = start.elapsed().as_millis() as u64;
             return Ok(json!({
                 "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
                 "has_more": messages.len() == limit,
+                "claim_id": claim_id,
+                "claim_expires_at": claim_expires_at,
+                "waited_ms": waited_ms,
+                "timed_out": false,
+                "capped": capped,
             }));
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Ok(json!({ "messages": [], "has_more": false, "timed_out": true }));
+        let remaining = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
+            None => Duration::from_secs(3600),
+        };
+        if !infinite && remaining.is_zero() {
+            let waited_ms = start.elapsed().as_millis() as u64;
+            return Ok(json!({
+                "messages": [],
+                "has_more": false,
+                "timed_out": true,
+                "waited_ms": waited_ms,
+                "capped": capped,
+            }));
         }
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {
-                return Ok(json!({ "messages": [], "has_more": false, "timed_out": true }));
+                if infinite {
+                    continue;
+                }
+                let waited_ms = start.elapsed().as_millis() as u64;
+                return Ok(json!({
+                    "messages": [],
+                    "has_more": false,
+                    "timed_out": true,
+                    "waited_ms": waited_ms,
+                    "capped": capped,
+                }));
             }
             changed = rx.changed() => {
                 if changed.is_err() {
-                    return Ok(json!({ "messages": [], "has_more": false }));
+                    let waited_ms = start.elapsed().as_millis() as u64;
+                    return Ok(json!({ "messages": [], "has_more": false, "waited_ms": waited_ms }));
                 }
             }
         }
@@ -1594,12 +1631,19 @@ async fn message_notify(
     params: &Value,
 ) -> Result<Value, (String, String)> {
     let caller = caller_principal(ctx, identity).await?;
-    let wait_ms = params
-        .get("wait_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(ctx.cfg.message_poll_max_ms);
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    let requested_wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+    let wait_ms = if ctx.cfg.message_poll_max_ms == 0 {
+        requested_wait_ms
+    } else {
+        requested_wait_ms.min(ctx.cfg.message_poll_max_ms)
+    };
+    let infinite = wait_ms == 0;
+    let start = tokio::time::Instant::now();
+    let deadline = if infinite {
+        None
+    } else {
+        Some(start + Duration::from_millis(wait_ms))
+    };
     let mut rx = ctx.mail.subscribe(&caller.jti).await;
     loop {
         let now = jwt::now();
@@ -1620,12 +1664,16 @@ async fn message_notify(
                 })).collect::<Vec<_>>(),
             }));
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let remaining = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
+            None => Duration::from_secs(3600),
+        };
+        if !infinite && remaining.is_zero() {
             return Ok(json!({ "pending": 0, "messages": [], "timed_out": true }));
         }
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {
+                if infinite { continue; }
                 return Ok(json!({ "pending": 0, "messages": [], "timed_out": true }));
             }
             changed = rx.changed() => {
@@ -1668,13 +1716,20 @@ async fn message_status(
 ) -> Result<Value, (String, String)> {
     let caller = caller_principal(ctx, identity).await?;
     let now = jwt::now();
-    let counts = ctx
+    let raw_counts = ctx
         .store
         .counts_for(&caller.jti, now)
         .await
         .map_err(internal)?;
-    let pending =
-        counts.get("pending").copied().unwrap_or(0) + counts.get("claimed").copied().unwrap_or(0);
+    let mut counts = serde_json::Map::new();
+    for key in ["pending", "claimed", "acked"] {
+        counts.insert(
+            key.to_string(),
+            json!(raw_counts.get(key).copied().unwrap_or(0)),
+        );
+    }
+    let pending = raw_counts.get("pending").copied().unwrap_or(0)
+        + raw_counts.get("claimed").copied().unwrap_or(0);
     let last_poll = caller.last_poll.unwrap_or(caller.created_at).max(0) as u64;
     let unresponsive = pending > 0 && now.saturating_sub(last_poll) > ctx.cfg.message_stale_s;
     Ok(json!({

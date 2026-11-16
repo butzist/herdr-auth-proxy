@@ -30,6 +30,7 @@ Messaging loop:
        from their shared parent.
   2. message-poll {wait_ms?, limit?} claims unread messages and returns them
      with a `claim_id`.
+  3. poll {wait_ms?, ...} waits for a message OR any owned child status change.
   3. message-ack {ids, claim_id} marks them done. Unacked claims become
      visible again after the lease expires.
 
@@ -85,6 +86,10 @@ Delivery is at-least-once:
 claims a message. The stage-2 fallback only prompts an idle target with a fixed
 proxy-generated string, and only if the target has not polled since the
 message was queued.
+
+`has_more` is true when the poll returned `limit` messages, meaning more may
+be queued for the caller. `claim_id` at the top level identifies the single
+claim for every message returned by that poll.
 "#;
 
 #[derive(Clone)]
@@ -258,6 +263,9 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
                 wait.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS),
             )
         }
+        "poll" => {
+            return Ok(run_poll(options, &arguments));
+        }
         "message-ack" => (
             "auth.message.ack",
             json!({
@@ -306,6 +314,231 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
         "content": [{"type": "text", "text": text}],
         "isError": false,
     }))
+}
+
+fn run_poll(options: &Options, arguments: &Value) -> Value {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    let wait_ms = arguments
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, 100) as usize;
+    let messages_enabled = arguments
+        .get("messages")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let targets_filter: Vec<String> = arguments
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let until: Vec<String> = arguments
+        .get("until")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let start = Instant::now();
+    let deadline = if wait_ms == 0 {
+        None
+    } else {
+        Some(start + std::time::Duration::from_millis(wait_ms))
+    };
+
+    // initial statuses
+    // helper closure to fetch statuses
+    let fetch = |opts: &Options,
+                 filter: &Vec<String>|
+     -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+        let resp = client::exchange(
+            &opts.socket,
+            opts.token.as_deref(),
+            "agent.list",
+            json!({}),
+            opts.timeout_ms,
+        )?;
+        let result = client::response_result(&resp)?;
+        let agents = result
+            .get("agents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut targets = Vec::new();
+        let mut statuses = BTreeMap::new();
+        for agent in agents {
+            let name = agent.get("name").and_then(Value::as_str).map(str::to_owned);
+            let pane = agent
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let target = name.clone().or(pane.clone());
+            let Some(target) = target else {
+                continue;
+            };
+            if !filter.is_empty()
+                && !filter.contains(&target)
+                && !pane.as_ref().map(|p| filter.contains(p)).unwrap_or(false)
+            {
+                continue;
+            }
+            targets.push(target.clone());
+            let status = if let Some(s) = agent.get("agent_status").and_then(Value::as_str) {
+                s.to_string()
+            } else {
+                // fetch via agent.get
+                let r = client::exchange(
+                    &opts.socket,
+                    opts.token.as_deref(),
+                    "agent.get",
+                    json!({"target": target}),
+                    opts.timeout_ms,
+                );
+                match r {
+                    Ok(resp) => client::response_result(&resp)
+                        .ok()
+                        .and_then(|v| {
+                            v.pointer("/agent/agent_status")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    Err(_) => "unknown".to_string(),
+                }
+            };
+            statuses.insert(target, status);
+        }
+        Ok((targets, statuses))
+    };
+
+    let (_initial_targets, initial_statuses) = match fetch(options, &targets_filter) {
+        Ok(v) => v,
+        Err(e) => return tool_error(&e),
+    };
+    let initial = initial_statuses;
+
+    loop {
+        // check messages
+        if messages_enabled {
+            let slice = if wait_ms == 0 {
+                2000u64
+            } else {
+                let remaining = deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                remaining.clamp(1, 5000)
+            };
+            let resp = client::exchange(
+                &options.socket,
+                options.token.as_deref(),
+                "auth.message.poll",
+                json!({"wait_ms": slice, "limit": limit}),
+                slice.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS),
+            );
+            if let Ok(resp) = resp
+                && let Ok(result) = client::response_result(&resp)
+            {
+                let msgs = result
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !msgs.is_empty() {
+                    let waited = start.elapsed().as_millis() as u64;
+                    let mut out = json!({
+                        "timed_out": false,
+                        "waited_ms": waited,
+                        "messages": msgs,
+                        "claim_id": result.get("claim_id"),
+                        "changes": [],
+                    });
+                    // statuses
+                    if let Ok((_, statuses)) = fetch(options, &targets_filter) {
+                        out["statuses"] = json!(statuses);
+                    }
+                    return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+                }
+            }
+        } else {
+            let slice = if wait_ms == 0 {
+                2000u64
+            } else {
+                let remaining = deadline
+                    .unwrap()
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as u64;
+                remaining.clamp(1, 5000)
+            };
+            std::thread::sleep(std::time::Duration::from_millis(slice));
+        }
+
+        // refresh statuses
+        let (_cur_targets, cur_statuses) = match fetch(options, &targets_filter) {
+            Ok(v) => v,
+            Err(e) => return tool_error(&e),
+        };
+
+        // detect changes against initial (and removed)
+        let mut changes = Vec::new();
+        let mut all_keys: std::collections::BTreeSet<String> = initial.keys().cloned().collect();
+        for k in cur_statuses.keys() {
+            all_keys.insert(k.clone());
+        }
+        for key in &all_keys {
+            let old = initial.get(key).map(|s| s.as_str()).unwrap_or("__absent__");
+            let new = cur_statuses
+                .get(key)
+                .map(|s| s.as_str())
+                .unwrap_or("killed");
+            if old != new
+                && (until.is_empty() || until.contains(&new.to_string()) || new == "killed")
+            {
+                changes.push(json!({"target": key, "from": old, "to": new}));
+            }
+        }
+        if !changes.is_empty() {
+            let waited = start.elapsed().as_millis() as u64;
+            let out = json!({
+                "timed_out": false,
+                "waited_ms": waited,
+                "messages": [],
+                "changes": changes,
+                "statuses": cur_statuses,
+            });
+            return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+        }
+
+        // timeout check
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            let waited = start.elapsed().as_millis() as u64;
+            let out = json!({
+                "timed_out": true,
+                "waited_ms": waited,
+                "messages": [],
+                "changes": [],
+                "statuses": cur_statuses,
+            });
+            return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+        }
+    }
 }
 
 fn tool_error(error: &str) -> Value {
@@ -442,6 +675,20 @@ fn tools() -> Vec<Value> {
                 "properties": {
                     "wait_ms": {"type": "integer"},
                     "limit": {"type": "integer"}
+                }
+            }),
+        ),
+        tool(
+            "poll",
+            "Wait for a message or any owned child status change (idle, killed, question, ...). Long-polls up to wait_ms (0 = indefinitely).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "wait_ms": {"type": "integer", "description": "Maximum wait in ms; 0 waits indefinitely"},
+                    "limit": {"type": "integer"},
+                    "messages": {"type": "boolean", "description": "Also wait for and claim incoming messages"},
+                    "targets": {"type": "array", "items": {"type": "string"}, "description": "Agent names/pane ids to watch; default all owned"},
+                    "until": {"type": "array", "items": {"type": "string"}, "description": "Only trigger on these child statuses"}
                 }
             }),
         ),
@@ -639,6 +886,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"message-send"));
         assert!(names.contains(&"message-poll"));
+        assert!(names.contains(&"poll"));
         assert!(names.contains(&"peer-grant"));
         assert!(names.contains(&"agent-read"));
         assert!(!names.contains(&"prompt"));
