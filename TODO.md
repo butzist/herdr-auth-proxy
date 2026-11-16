@@ -24,6 +24,28 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
   sandbox is the deployment's **bwrap** wrapper (same uid → no uid-based trust);
   `layout.apply` stays denied (explicit argv bypass).
 
+## MCP server + agent messaging
+
+Implemented per [MCP_MESSAGING_PLAN.md](MCP_MESSAGING_PLAN.md). Remaining work:
+real opencode MCP client validation (notification surfacing / wake-up) and
+integration tests against a real herdr.
+
+- [x] Turso DB at `$XDG_STATE_HOME/herdr-auth-proxy/state.db` for messages,
+      delivery claims, ownership and token lineage; fail closed on corruption.
+      `state.json` is ignored.
+- [x] Proxy extensions: `auth.message.send/poll/ack/notify/status` and
+      `auth.message.peer.grant/revoke/list`; parent ⇄ child always, siblings
+      only with a direct parent grant; JWT-gated and relationship-checked.
+- [x] `herdr-auth mcp` stdio server (replaces `herdr-agent`); built-in
+      `initialize.instructions`, tool descriptions, and doc resources.
+- [x] Two-stage wake-up: MCP notification, then fixed proxy-generated
+      `agent.prompt` after a configurable idle-only timeout if still pending and
+      unpolled; `message-status` reports last poll/counts/unresponsive hints.
+- [x] Remove `pane.read` / `agent.prompt` from the workflow allowlist and MCP
+      tools; keep admin-only `pane.read` / `agent-read` escape hatch.
+- [x] Update AGENTS.md invariants. ARCHITECTURE.md updated for the messaging
+      model (further refinement may follow real-world validation).
+
 ## Phase 0 — scaffold
 
 - [x] Add `justfile` (build, test, clippy, fmt) + rust-toolchain pin (nightly via flake)
@@ -110,7 +132,9 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 
 - [x] Record pane/tab/workspace ids from creation responses (`pane.split`,
       `tab.create`, ...) per sub
-- [x] Persist ownership across restarts (`state.json`); prune expired tokens
+- [x] Persist ownership, lineage, and messages across restarts (`state.db`);
+      prune expired tokens and enforce fail-closed DB startup. `state.json`
+      is ignored.
 - [x] Enforce on all pane-tab-targeting methods; owned-only list filtering
 - [ ] Optional metadata mirror (`auth_owner`, `auth_jti` via
       `pane.report_metadata`)
@@ -135,12 +159,8 @@ decisions live in [ARCHITECTURE.md](ARCHITECTURE.md) (§12 = decisions;
 - [x] `herdr-auth` client CLI: `call <method> --json`, `agent spawn`,
       `token mint`, `whoami`, `methods`; JWT via `--token`/`--token-file`/
       `$HERDR_AUTH_JWT` (auth.hello first line) or env fallback
-- [x] `herdr-agent` convenience CLI: `spawn`, `list`, `get`, `read`, `prompt`,
-      `wait`, and `kill`; prompt text comes from `--text`, `--text-file`, or
-      stdin (verbatim, no JSON escaping), waits for idle by default (900 s,
-      `--no-wait` opt-out), and sizes the socket timeout to `wait + 60 s`.
-      `read` prints terminal text; `kill` closes the pane (`tab.close` with
-      `--tab`) after resolving names via `agent.get`
+- [x] ~~`herdr-agent` convenience CLI~~ removed; replaced by `herdr-auth mcp`
+      (stdio MCP server) with durable messaging tools.
 - [x] Grantable-capability validation in the CLI (`--grant`, 4 capabilities)
 - [x] Nix packaging: `packages.default` (all binaries), `apps`, `overlays`,
       `nixosModules.default`, `homeManagerModules.default`, `formatter`;

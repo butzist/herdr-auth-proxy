@@ -22,6 +22,20 @@ pub struct Config {
     pub max_token_ttl_s: u64,
     /// How long the upstream socket may be unreachable before the proxy exits.
     pub death_grace_s: u64,
+    /// Maximum `wait_ms` accepted by `auth.message.poll` / `.notify`.
+    pub message_poll_max_ms: u64,
+    /// Claim lease for at-least-once delivery; unacked messages reappear.
+    pub message_claim_lease_s: u64,
+    /// Default lifetime of a queued message.
+    pub message_ttl_s: u64,
+    /// Largest accepted message body.
+    pub message_max_bytes: usize,
+    /// Stage 1 notification to stage 2 `agent.prompt` fallback delay.
+    pub message_wakeup_after_s: u64,
+    /// Minimum interval between wake-up prompts for one target.
+    pub message_wakeup_min_interval_s: u64,
+    /// Age after which an idle target with unread mail is flagged unresponsive.
+    pub message_stale_s: u64,
 }
 
 impl Default for Config {
@@ -32,6 +46,13 @@ impl Default for Config {
             agent_ttl_s: 86_400,
             max_token_ttl_s: 86_400,
             death_grace_s: 15,
+            message_poll_max_ms: 30_000,
+            message_claim_lease_s: 30,
+            message_ttl_s: 86_400,
+            message_max_bytes: 262_144,
+            message_wakeup_after_s: 10,
+            message_wakeup_min_interval_s: 30,
+            message_stale_s: 120,
         }
     }
 }
@@ -43,6 +64,7 @@ pub struct Paths {
     pub auth_socket: PathBuf,
     pub upstream_socket: PathBuf,
     pub state_file: PathBuf,
+    pub state_db: PathBuf,
     pub pid_file: PathBuf,
     pub log_file: PathBuf,
 }
@@ -122,6 +144,7 @@ pub fn load() -> Result<(Config, Paths), String> {
 
     let paths = Paths {
         state_file: state_dir.join("state.json"),
+        state_db: state_dir.join("state.db"),
         pid_file: runtime.join("proxy.pid"),
         log_file: state_dir.join("proxy.log"),
         config_dir,
@@ -142,5 +165,8 @@ mod tests {
         assert_eq!(config.agent_ttl_s, 86_400);
         assert_eq!(config.max_token_ttl_s, 86_400);
         assert_eq!(config.death_grace_s, 15);
+        assert_eq!(config.message_poll_max_ms, 30_000);
+        assert_eq!(config.message_claim_lease_s, 30);
+        assert_eq!(config.message_max_bytes, 262_144);
     }
 }

@@ -127,7 +127,6 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     // read (owned only / filtered)
     "pane.list",
     "pane.get",
-    "pane.read",
     "pane.wait_for_output",
     "tab.list",
     "tab.get",
@@ -138,12 +137,19 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     // control (owned)
     "tab.close",
     "pane.close",
-    "agent.prompt",
     // proxy extensions
     "auth.whoami",
     "auth.methods",
     "auth.token.mint",
     "auth.agent.spawn",
+    "auth.message.send",
+    "auth.message.poll",
+    "auth.message.notify",
+    "auth.message.ack",
+    "auth.message.status",
+    "auth.message.peer.grant",
+    "auth.message.peer.revoke",
+    "auth.message.peer.list",
 ];
 
 pub fn is_known(method: &str) -> bool {
@@ -274,6 +280,9 @@ mod tests {
         assert!(!allowed(Role::Orchestrator, "tab.create"));
         assert!(!allowed(Role::Orchestrator, "agent.start"));
         assert!(!allowed(Role::Orchestrator, "pane.send_text"));
+        assert!(!allowed(Role::Orchestrator, "pane.read"));
+        assert!(!allowed(Role::Orchestrator, "agent.prompt"));
+        assert!(allowed(Role::Orchestrator, "auth.message.send"));
         assert!(!allowed(Role::Orchestrator, "layout.apply"));
         assert!(!allowed(Role::Orchestrator, "events.subscribe"));
         assert!(!allowed(Role::Orchestrator, "workspace.create"));

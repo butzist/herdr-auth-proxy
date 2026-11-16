@@ -160,8 +160,8 @@ Binaries:
 | Binary | Role |
 |---|---|
 | `herdr-auth-proxy` | session management only: `serve` (default), `wrap`, `stop`, `status`. |
-| `herdr-auth` | generic client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`. |
-| `herdr-agent` | focused orchestrator client: `spawn` (same atomic extension as `herdr-auth agent spawn`), `list`, `get`, `read`, `prompt` (plain text from `--text`, `--text-file`, or stdin; no JSON escaping), `wait`, and `kill` (`pane.close`, or `tab.close` with `--tab`; herdr has no `agent.kill`). |
+| `herdr-auth` | generic client: `call`, `whoami`, `methods`, `token mint`, `agent spawn`, and `mcp` (stdio MCP server for durable agent messaging/orchestration). |
+| `herdr-agent` | *(removed)* — replaced by `herdr-auth mcp`. |
 | `herdr-auth-launch` | *deferred / optional later feature*: client helper (exec + relay modes) for deployments without a sandbox wrapper (§11). |
 
 ## 4. Authentication design
@@ -332,7 +332,7 @@ flowchart TD
     P4 --> P5[agent + opencode plugin connect to auth.sock;<br/>JWT picked up from environ]
     P5 --> P6[proxy binds identity to pane,<br/>records pane ownership]
     P6 --> D2([agent restricted to its grants])
-    D2 --> O1[orchestrator: agent.prompt / agent.wait /<br/>agent.read / pane.read / pane.close on OWNED panes]
+    D2 --> O1[orchestrator: agent.wait / agent lifecycle /<br/>close OWNED panes + auth.message.*]
     O1 --> X
 ```
 
@@ -344,8 +344,8 @@ call, with token binding and failure cleanup (§7.1). Direct `pane.split`,
 
 | Persona | Token | Allowed herdr methods (default) |
 |---|---|---|
-| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` must equal the claim; `agent`/`source` pinned to `opencode`); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `pane.read`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output`, `agent.wait` (own pane; `target` forced to the claim). Default: `["report_status"]`. Exactly covers the opencode plugin. |
-| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.read`, `pane.wait_for_output`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.read`, `agent.wait`; control (owned): `tab.close`, `pane.close`, `agent.prompt`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`. **Everything else is denied** — including direct `pane.split`, `tab.create` and `agent.start` (they create/use plain shells), `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `pane.send_*`, `agent.send_keys`, `command.invoke`, and all UI/focus/zoom/scroll methods. |
+| **agent** (use case 1) | role=agent, `pane_id`-bound, `grants[]` | `ping` always; `report_status` → `pane.report_agent`, `pane.report_agent_session` (`pane_id` must equal the claim; `agent`/`source` pinned to `opencode`); `report_metadata` → `pane.report_metadata` (own pane); `read_own_pane` → `pane.get`, `agent.get` (own pane); `wait_own_output` → `pane.wait_for_output`, `agent.wait` (own pane; `target` forced to the claim). Default: `["report_status"]`. Exactly covers the opencode plugin. Plus durable messaging (`auth.message.*`, peer grants) subject to relationship checks. |
+| **orchestrator** (use case 2) | role=orchestrator, perm object | **Minimal workflow allowlist (default-deny)**: `ping`; create: **only** `auth.agent.spawn` (atomic, proxy env/cwd/token authority); read (owned only, list responses filtered): `pane.list`, `pane.get`, `pane.wait_for_output`, `tab.list`, `tab.get`, `agent.list`, `agent.get`, `agent.wait`; control (owned): `tab.close`, `pane.close`; extensions: `auth.whoami`, `auth.methods`, `auth.token.mint`, `auth.agent.spawn`, plus `auth.message.*` and peer-grant management (relationship-checked). **Everything else is denied** — including `agent.prompt`, `pane.read` (admin-only escape hatch), direct `pane.split`/`tab.create`/`agent.start`, `layout.apply`, `events.*`, `workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, raw-input methods, and all UI/focus/zoom/scroll methods. |
 | **admin** (reserved) | role=admin | All methods + `auth.*`; not issued by the default bootstrap (the bootstrap token is orchestrator-scoped and cannot mint admin). |
 
 **Grantable agent capabilities.** An orchestrator may grant only a subset of
@@ -359,17 +359,20 @@ explicit `perm.agent_grants` narrows it. Agent tokens default to
 |---|---|
 | `report_status` | `pane.report_agent`, `pane.report_agent_session` (pane forced to the claim) |
 | `report_metadata` | `pane.report_metadata` |
-| `read_own_pane` | `pane.get`, `pane.read`, `agent.get` |
+| `read_own_pane` | `pane.get`, `agent.get` |
 | `wait_own_output` | `pane.wait_for_output`, `agent.wait` (target forced to the claim) |
 
 **Default-deny.** The orchestrator allowlist is exhaustive for the current
 orchestrator/developer/reviewer workflow; everything else is denied until
-deliberately added. That includes all raw input (`pane.send_text`,
-`pane.send_keys`, `pane.send_input`, `pane.input.set`, `agent.send_keys`,
-`command.invoke`), `layout.apply` (explicit argv = unsandboxed code as the herdr
-user), `events.*` (unfiltered events would leak non-owned panes — use
-`agent.wait`/`agent.read`), `workspace.*`, `worktree.*`, `plugin.*`,
-`integration.*`, `server.*`, `notification.show`, and all UI methods.
+deliberately added. That includes `agent.prompt` and `pane.read` (raw terminal
+reads are admin-only), all raw input (`pane.send_text`, `pane.send_keys`,
+`pane.send_input`, `pane.input.set`, `agent.send_keys`, `command.invoke`),
+`layout.apply` (explicit argv = unsandboxed code as the herdr user), `events.*`
+(unfiltered events would leak non-owned panes — use `agent.wait`/messaging),
+`workspace.*`, `worktree.*`, `plugin.*`, `integration.*`, `server.*`,
+`notification.show`, and all UI methods. Durable messaging is the explicit
+exception: `auth.message.*`/peer-grant methods are available to authenticated
+roles but are JWT-gated and relationship-checked.
 The orchestrator cannot create a plain pane: `pane.split`, `tab.create` and
 `agent.start` are denied. The only creation path is `auth.agent.spawn`, which
 mints the child token, creates the root pane with the proxy-built env and token
@@ -467,6 +470,8 @@ NDJSON codec:
 | `auth.token.mint` | mint a scoped child token (subset + `exp` clamped to minter) |
 | `auth.methods` | proxy-known herdr methods + policy (introspection) |
 | `auth.agent.spawn` | **atomic**: `tab.create` + mint/bind child token + `agent.start` (kind whitelist; args passed to the wrapper); closes the tab and revokes the token if any step fails |
+| `auth.message.send` / `poll` / `ack` / `notify` / `status` | durable parent⇄child and granted-sibling messaging (JWT-gated, relationship-checked, claim/ack delivery) |
+| `auth.message.peer.grant` / `revoke` / `list` | direct, non-transitive, revocable sibling links between a parent's own children |
 
 `auth.agent.spawn` params: `kind`, `args`, optional `name`, `label`, `focus`,
 `ttl_s`, `grants` (agent tokens never carry `perm`, so it is rejected). The
@@ -489,18 +494,21 @@ cleanup path.
 **How clients call extensions** (they are not in the herdr CLI):
 
 1. **`herdr-auth` CLI** (shipped with the proxy): `herdr-auth agent spawn --kind
-   opencode --cwd … -- <args>`; generic `herdr-auth call auth.agent.spawn --json
-   '{…}'`; `herdr-auth token mint …`. The focused **`herdr-agent`** CLI wraps
-   `spawn`, `agent.list`, `agent.get`, `agent.read`, `agent.prompt`,
-   `agent.wait`, `pane.close`, and `tab.close`; prompt text is read verbatim
-   from `--text`, `--text-file`, or stdin instead of being embedded in a JSON
-   params argument. Auth via `HERDR_AUTH_JWT` in its env (peer-environ mode) or
-   `--token`.
+   opencode --cwd … -- <args>`; generic `herdr-auth call <method> --params
+   '{…}'`; `herdr-auth token mint …`. `herdr-auth mcp` runs the stdio MCP
+   server (tools: agent lifecycle, messaging, peer grants, whoami, admin-only
+   agent-read). Auth via `HERDR_AUTH_JWT` / `--token` / `--token-file`.
 2. **Raw NDJSON** with any tool, e.g. `printf '%s\n' '{"id":"1","method":
-   "auth.agent.spawn","params":{…}}' | socat - UNIX-CONNECT:<auth.sock>` (the
+   "auth.message.send","params":{…}}' | socat - UNIX-CONNECT:<auth.sock>` (the
    connecting process must carry `HERDR_AUTH_JWT`, or send `auth.hello` first).
 3. **Client library / SDK**: the same one-request-per-connection pattern as
    herdr's API client (§2.2).
+
+Durable messaging, ownership and lineage are stored in
+`$XDG_STATE_HOME/herdr-auth-proxy/state.db` (Turso). The proxy fails closed if
+the DB cannot be opened or passes integrity checks. `state.json` is ignored. See
+[MCP_MESSAGING_PLAN.md](MCP_MESSAGING_PLAN.md) for the implemented message/wake-up
+semantics.
 
 ## 8. Unknown/new command logging (explicit requirement)
 
@@ -520,8 +528,9 @@ cleanup path.
   direct `pane.split`/`tab.create` are recorded the same way. `workspace.create`
   is never allowed for orchestrators and `layout.apply` stays denied. Ownership
   is keyed by the authenticated `sub` (+ child token `jti` for agent panes).
-- Ownership is **persisted** across restarts (state dir, e.g. SQLite/JSON) — the
-  proxy, not herdr, is authoritative.
+- Ownership, lineage and messages are **persisted** across restarts in
+  `$XDG_STATE_HOME/herdr-auth-proxy/state.db` (Turso) — the proxy, not herdr, is
+  authoritative. Corrupt/unopenable state is fail-closed. `state.json` is ignored.
 - Enforcement: every pane-targeting request validates `pane_id` against the
   caller's owned set (orchestrator); agent-role requests are pinned to their own
   `pane_id` claim; list/snapshot responses are filtered to owned ids.
@@ -571,11 +580,15 @@ auth_socket = "auto"           # $XDG_RUNTIME_DIR/herdr-auth-proxy/auth.sock
 agent_ttl_s = 86400            # default agent lifetime
 max_token_ttl_s = 86400        # hard cap for every requested TTL
 death_grace_s = 15
+# messaging (see MCP_MESSAGING_PLAN.md): message_poll_max_ms,
+# message_claim_lease_s, message_ttl_s, message_max_bytes,
+# message_wakeup_after_s, message_wakeup_min_interval_s, message_stale_s
 ```
 
-The signing key is never persisted. State lives in
-`$XDG_STATE_HOME/herdr-auth-proxy/`; the auth socket and pid file live in
-`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. There is no bootstrap-token file.
+The signing key is never persisted. Durable state lives in
+`$XDG_STATE_HOME/herdr-auth-proxy/state.db` (`state.json` ignored); the auth
+socket and pid file live in `$XDG_RUNTIME_DIR/herdr-auth-proxy/`. There is no
+bootstrap-token file. An unopenable/corrupt DB is fail-closed.
 
 Packaging: `packages.default` builds all binaries;
 `nixosModules.default` (opt-in `programs.herdr-auth-proxy.enable`) and

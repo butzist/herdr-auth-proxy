@@ -7,7 +7,7 @@ Read **ARCHITECTURE.md** before changing anything security-relevant, and
 
 ```bash
 nix develop        # devshell (rust nightly, just, jq, ...)
-nix build .#       # package both binaries (needs nix-command/flakes enabled)
+nix build .#       # package herdr-auth-proxy + herdr-auth (needs nix-command/flakes)
 just build         # or: cargo build
 just test          # or: cargo test
 just clippy        # cargo clippy -- -D warnings
@@ -52,7 +52,17 @@ just fmt           # cargo fmt
 10. **Workflow-only allowlist.** Methods outside the current orchestrator /
     developer / reviewer workflow stay denied (no events, workspace, worktree,
     plugin, integration, layout, UI or raw-input methods) until deliberately
-    added.
+    added. `pane.read` and `agent.prompt` are removed from the workflow;
+    `agent-read` (tool) / `pane.read` (proxy method) is admin-only. The
+    `auth.message.*` methods are the explicit messaging exception: available to
+    every authenticated role, but still JWT-gated and relationship-checked.
+11. **Durable messaging.** Messages, ownership and lineage live in
+    `$XDG_STATE_HOME/herdr-auth-proxy/state.db` (Turso). Delivery is
+    at-least-once: a claim lease must be acked; unacked messages reappear.
+    Parent ⇄ child is always allowed; siblings require a direct, non-transitive,
+    revocable parent grant. Wake-up is idle-only and uses a fixed proxy prompt.
+12. **Fail closed on state errors.** An unopenable/corrupt `state.db` prevents
+    the proxy from serving; no silent state reset. `state.json` is ignored.
 
 ## Upstream reference
 

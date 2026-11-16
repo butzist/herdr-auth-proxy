@@ -74,6 +74,8 @@ enum Command {
     Whoami,
     /// List herdr methods known to the proxy and its policy
     Methods,
+    /// Run the stdio MCP server (replaces the old herdr-agent binary)
+    Mcp,
     /// Token operations
     Token {
         #[command(subcommand)]
@@ -158,6 +160,15 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    if matches!(cli.command, Command::Mcp) {
+        let token = resolve_token(&cli)?;
+        let socket = cli.socket.clone().unwrap_or_else(client::default_socket);
+        return herdr_auth_proxy::mcp::run(herdr_auth_proxy::mcp::Options {
+            socket,
+            token,
+            timeout_ms: cli.timeout_ms,
+        });
+    }
     let (method, params) = build_request(&cli.command)?;
     let token = resolve_token(&cli)?;
     let socket = cli.socket.clone().unwrap_or_else(client::default_socket);
@@ -194,6 +205,7 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
         }
         Command::Whoami => Ok(("auth.whoami".into(), json!({}))),
         Command::Methods => Ok(("auth.methods".into(), json!({}))),
+        Command::Mcp => Err("`mcp` is handled before request building".into()),
         Command::Token {
             command:
                 TokenCommand::Mint {

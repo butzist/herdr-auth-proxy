@@ -49,7 +49,6 @@ pub fn methods(grants: &[String]) -> Vec<&'static str> {
             "report_metadata" => methods.push("pane.report_metadata"),
             "read_own_pane" => {
                 methods.push("pane.get");
-                methods.push("pane.read");
                 methods.push("agent.get");
             }
             "wait_own_output" => {
@@ -73,6 +72,14 @@ mod tests {
         assert!(methods.contains(&"pane.report_agent_session"));
         assert!(methods.contains(&"ping"));
         assert!(!methods.contains(&"pane.read"));
+    }
+
+    #[test]
+    fn read_own_pane_does_not_include_raw_terminal_reads() {
+        let methods = methods(&["read_own_pane".into()]);
+        assert!(methods.contains(&"pane.get"));
+        assert!(!methods.contains(&"pane.read"));
+        assert!(!methods.contains(&"agent.prompt"));
     }
 
     #[test]

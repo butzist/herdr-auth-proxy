@@ -20,14 +20,17 @@ need — and nothing more.
   according to the permissions in the JWT. A proxy restart invalidates all
   outstanding tokens.
 - Supports two main personas:
-  1. **agent** — may only report its own status to herdr (exactly what the herdr
-     opencode integration plugin does) and optionally read its own pane.
+  1. **agent** — may report its own status to herdr (exactly what the herdr
+     opencode integration plugin does) and, when granted, read/wait on its own
+     pane. Agents coordinate with other agents via **durable messages**
+     (`message-send` / `message-poll` / `message-ack`).
   2. **orchestrator** — may start agents **only through the atomic
      `auth.agent.spawn`** (kind `opencode`; args are validated by the sandbox
-     wrapper), prompt them, read their status, and read/close panes **it owns**
-     (pane ownership is tracked; list responses are filtered). It cannot create
-     plain panes and can *never* send raw shell/pty input. It can mint scoped
-     child tokens for the agents it creates.
+     wrapper), wait for and inspect agent lifecycle, and close panes/tabs **it
+     owns** (pane ownership is tracked; list responses are filtered). It cannot
+     create plain panes and can *never* send raw shell/pty input. Orchestration
+     and results flow through messages, not `agent.prompt` or `pane.read`
+     scraping. It can mint scoped child tokens and grant direct sibling links.
 - Works with your existing **bwrap sandbox wrapper** (e.g. an `opencode` wrapper
   that hides herdr's real socket in a mount namespace): it only needs to set
   `HERDR_SOCKET_PATH` to the proxy socket, pass `HERDR_AUTH_JWT` through, and
@@ -35,25 +38,31 @@ need — and nothing more.
   opencode integration) then work through the proxy with **zero changes** — the
   proxy picks the token up from the connecting peer's environment. Auth is
   JWT-only; uid is *not* trusted (bwrap keeps the herdr uid).
+- **Durable messaging**: `auth.message.*` provides parent ⇄ child and
+  parent-granted direct sibling communication, with claim/ack delivery, idle
+  wake-up notifications, and state persisted in `state.db` (Turso).
 - **Default-deny to the workflow**: only methods needed by the orchestrator
-  (spawn/prompt/read/close owned panes) and status-reporting agents are allowed;
-  everything else is refused (no layout, events, worktree, plugin, integration,
-  UI or raw-input methods).
+  (spawn/wait/lifecycle/close owned panes + messaging) and status-reporting
+  agents are allowed; everything else is refused (no layout, events, worktree,
+  plugin, integration, UI, raw-input, `agent.prompt`, or `pane.read` for normal
+  roles). Raw terminal reads are an **admin-only** escape hatch.
 - Logs every unknown/new herdr method (still denied) so policy can be updated
   when herdr adds commands.
 
 ## Status
 
 **Early implementation.** The proxy core works (in-memory signing key/config/JWT,
-hello + peer-environ auth, method allowlists, ownership filtering, mint, atomic spawn,
-`wrap`/`stop`/`status`) and the `herdr-auth`/`herdr-agent` CLIs are complete.
-Validated against a fake upstream; not yet against a real herdr. See
-[ARCHITECTURE.md](ARCHITECTURE.md) (design, herdr findings, diagrams, decisions)
-and [TODO.md](TODO.md) (remaining work).
+hello + peer-environ auth, method allowlists, ownership filtering, mint, atomic
+spawn, Turso-backed state/messaging, stdio MCP server, and `wrap`/`stop`/`status`).
+`herdr-auth` provides proxy control and the MCP server (`herdr-auth mcp`);
+`herdr-agent` was removed. Validated against a fake upstream; not yet against a
+real herdr. See [ARCHITECTURE.md](ARCHITECTURE.md) (design, herdr findings,
+diagrams, decisions), [MCP_MESSAGING_PLAN.md](MCP_MESSAGING_PLAN.md), and
+[TODO.md](TODO.md) (remaining work).
 
 ## Install (Nix)
 
-The flake builds all binaries (`herdr-auth-proxy`, `herdr-auth`, `herdr-agent`):
+The flake builds `herdr-auth-proxy` and `herdr-auth`:
 
 ```nix
 # flake.nix
@@ -81,9 +90,11 @@ herdr-auth-proxy wrap -- herdr
 ```
 
 The signing key is generated **in memory** at proxy startup and is never written
-to disk. There is no private-key file to protect. State lives in
-`$XDG_STATE_HOME/herdr-auth-proxy/`; the auth socket and pid file live in
-`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. **No bootstrap token is written to disk.**
+to disk. There is no private-key file to protect. Durable state (ownership,
+lineage, messages) lives in `$XDG_STATE_HOME/herdr-auth-proxy/state.db`
+(Turso); `state.json` is ignored. The auth socket and pid file live in
+`$XDG_RUNTIME_DIR/herdr-auth-proxy/`. **No bootstrap token is written to disk.** An
+unopenable/corrupt `state.db` is fatal (fail closed).
 
 `herdr-auth-proxy wrap` starts the proxy, receives a process-scoped bootstrap
 token from it over a pipe, and sets that token as `HERDR_AUTH_JWT` in the herdr
@@ -185,9 +196,9 @@ Additional rules:
 
 ## `herdr-auth` CLI
 
-Ships with the proxy; speaks the same NDJSON envelope plus the `auth.*`
-extension methods. This is the command used for token minting and agent
-operations; `herdr-auth-proxy` only manages the proxy session.
+`herdr-auth-proxy` manages the proxy session (`serve`, `wrap`, `stop`,
+`status`); `herdr-auth` handles token minting, direct proxy calls, and the MCP
+server.
 
 ```bash
 export HERDR_AUTH_SOCKET="$XDG_RUNTIME_DIR/herdr-auth-proxy/auth.sock"
@@ -197,60 +208,39 @@ herdr-auth whoami
 herdr-auth methods
 herdr-auth agent spawn --kind opencode --label foo \
   --grant report_status --grant read_own_pane -- --model sonnet
-# pane-bound mint requires the caller to own w1:p2:
 herdr-auth token mint --role agent --pane w1:p2 --grant report_status
-# optional: --cwd/--workspace must match the caller token, they cannot change it
 herdr-auth call agent.list --params '{}'
 ```
 
-## `herdr-agent` CLI
+## MCP server (`herdr-auth mcp`)
 
-`herdr-agent` is the ergonomic front-end for the orchestrator workflow:
-`spawn`, `list`, `get`, `read`, `prompt`, `wait`, and `kill`. Unlike
-`herdr-auth call agent.prompt --params '<json>'`, prompt text is passed as
-**plain text** (inline, from a file, or on stdin), so it never has to be
-JSON-escaped; file/stdin input avoids shell quoting too.
+`herdr-auth mcp` is a stdio MCP server that replaces the old `herdr-agent`
+binary. Configure it in your MCP client with the same JWT used for proxy auth:
 
 ```bash
-# Same atomic spawn as `herdr-auth agent spawn`.
-herdr-agent spawn --kind opencode --name worker \
-  --grant report_status --grant read_own_pane -- --model sonnet
-
-# Inspect owned agents and read their terminal output.
-herdr-agent list
-herdr-agent get worker
-herdr-agent read worker --lines 200
-herdr-agent read worker --source recent-unwrapped --ansi
-
-# Prompt text from a file (verbatim, including newlines/quotes).
-herdr-agent prompt worker --text-file prompt.md
-
-# Or stream it from stdin.
-printf 'review the diff on this branch\n' | herdr-agent prompt worker
-
-# Inline text, or fire-and-forget without waiting for idle.
-herdr-agent prompt worker --text 'summarize the failures'
-herdr-agent prompt worker --text-file prompt.md --no-wait --pretty
-
-# Wait explicitly after a --no-wait prompt.
-herdr-agent wait worker --until idle --wait-ms 300000
-
-# Close the agent's pane, or its whole tab.
-herdr-agent kill worker
-herdr-agent kill w1:p7
-herdr-agent kill --tab worker
+export HERDR_AUTH_JWT=...
+herdr-auth mcp
 ```
 
-`prompt` waits for the agent to become idle by default (`--wait-ms`, default
-900000). The socket timeout automatically becomes `wait + 60s`; pass
-`--timeout-ms` to override it. `--no-wait` submits the prompt and returns
-immediately. An empty prompt is rejected.
+Tools: `agent-spawn`, `agent-list`, `agent-get`, `agent-wait`, `agent-kill`,
+`message-send`, `message-poll`, `message-ack`, `message-status`,
+`peer-grant`, `peer-revoke`, `peer-list`, `whoami`, plus **admin-only**
+`agent-read`.
 
-`read` prints terminal text by default; `--pretty` or `--raw` shows the full
-JSON instead. There is no herdr `agent.kill` method: `kill` closes the agent's
-pane with `pane.close` (`tab.close` with `--tab`). Agent names are resolved via
-`agent.get` first; pane/tab ids go straight to the close call. `send-keys` is
-intentionally not exposed because raw input methods are denied to orchestrators.
+Messaging is the orchestration path (no `agent.prompt` / `pane.read` in the
+normal workflow):
+
+1. `message-send` to `to` = agent name/pane/sub/jti or `"parent"`. A `from`
+   field is rejected; the proxy sets sender identity.
+2. `message-poll` claims unread messages and returns `claim_id` values.
+3. `message-ack` with matching `claim_id` (unacked claims reappear after the
+   lease).
+4. Use `thread_id` / `reply_to` for request-response flows.
+
+Relationship rules: parent ⇄ child always; siblings need a direct, non-transitive,
+revocable `peer-grant` from their shared parent. Idle workers get an MCP
+notification and, if they still have unpolled mail, a fixed proxy-generated
+`agent.prompt` nudge after a configurable timeout.
 
 Start/stop together with the herdr server (no systemd unit):
 
@@ -272,17 +262,31 @@ a report for another pane is rejected, and `agent`/`source` cannot be changed.
 derived by herdr's tool integration and is rejected by herdr itself.
 `resume_argv` is rejected for agent tokens (herdr would execute it on restore).
 
+Start/stop together with the herdr server (no systemd unit):
+
+```bash
+herdr-auth-proxy wrap -- herdr      # ensures the proxy, then runs herdr
+herdr-auth-proxy status
+herdr-auth-proxy stop
+```
+
+Grantable agent capabilities: `report_status`, `report_metadata`,
+`read_own_pane`, `wait_own_output` (see ARCHITECTURE §5). `read_own_pane`
+covers `pane.get` / `agent.get`; `wait_own_output` allows `pane.wait_for_output`
+and `agent.wait` on the agent's own pane. `pane.read` and `agent.prompt` are not
+part of the normal workflow.
+
 ## Topology
 
 ```
 herdr server ── herdr.sock (real, private) ── herdr-auth-proxy ── auth.sock (JWT-gated)
                                                                   ▲            ▲
-                                                       gated agent panes   orchestrator
-                                                   (sandbox wrapper + env JWT)   (herdr-auth CLI)
+                                                       gated agent panes   orchestrator/MCP
+                                                   (sandbox wrapper + env JWT)   (herdr-auth mcp)
 ```
 
 All client traffic connects only to the proxy; herdr's real socket stays unreachable
-for sandboxed identities.
+for sandboxed identities. Durable ownership and messages live in `state.db`.
 
 ## Sandbox wrapper requirements
 
@@ -344,4 +348,4 @@ ARCHITECTURE.md for the method registry source and how to regenerate it.
 
 ## License
 
-Apache-2.0 (matching herdr). No `LICENSE` file has been added yet — see TODO.md.
+Apache-2.0 (matching herdr). See `LICENSE`.
