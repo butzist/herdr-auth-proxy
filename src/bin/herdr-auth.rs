@@ -103,6 +103,9 @@ enum TokenCommand {
         /// Bind an agent token to a pane
         #[arg(long)]
         pane: Option<String>,
+        /// Sandboxed reporting kind for an agent token (must be configured on the proxy)
+        #[arg(long = "agent-kind")]
+        agent_kind: Option<String>,
         /// Safe working directory for panes/agents created with this token
         #[arg(long)]
         cwd: Option<String>,
@@ -213,6 +216,7 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
                     sub,
                     ttl_s,
                     pane,
+                    agent_kind,
                     cwd,
                     workspace_id,
                     grants,
@@ -230,6 +234,9 @@ fn build_request(command: &Command) -> Result<(String, Value), String> {
             }
             if let Some(pane) = pane {
                 params.insert("pane_id".into(), json!(pane));
+            }
+            if let Some(agent_kind) = agent_kind {
+                params.insert("agent_kind".into(), json!(agent_kind));
             }
             if let Some(cwd) = cwd {
                 params.insert("cwd".into(), json!(cwd));
@@ -350,6 +357,7 @@ mod tests {
                 sub: Some("bob".into()),
                 ttl_s: Some(120),
                 pane: Some("w1:p2".into()),
+                agent_kind: Some("opencode".into()),
                 cwd: Some("/work".into()),
                 workspace_id: Some("w1".into()),
                 grants: vec!["report_metadata".into()],
@@ -360,6 +368,7 @@ mod tests {
         assert_eq!(method, "auth.token.mint");
         assert_eq!(params["role"], json!("agent"));
         assert_eq!(params["pane_id"], json!("w1:p2"));
+        assert_eq!(params["agent_kind"], json!("opencode"));
         assert_eq!(params["cwd"], json!("/work"));
         assert_eq!(params["workspace_id"], json!("w1"));
         assert_eq!(params["grants"], json!(["report_metadata"]));
