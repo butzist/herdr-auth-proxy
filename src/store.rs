@@ -954,6 +954,7 @@ mod tests {
             exp: None,
             role: Role::Agent,
             pane_id: None,
+            agent_kind: None,
             cwd: None,
             workspace_id: None,
             grants: Vec::new(),

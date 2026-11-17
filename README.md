@@ -25,12 +25,16 @@ need — and nothing more.
      pane. Agents coordinate with other agents via **durable messages**
      (`message-send` / `message-poll` / `message-ack`).
   2. **orchestrator** — may start agents **only through the atomic
-     `auth.agent.spawn`** (kind `opencode`; args are validated by the sandbox
-     wrapper), wait for and inspect agent lifecycle, and close panes/tabs **it
-     owns** (pane ownership is tracked; list responses are filtered). It cannot
-     create plain panes and can *never* send raw shell/pty input. Orchestration
-     and results flow through messages, not `agent.prompt` or `pane.read`
-     scraping. It can mint scoped child tokens and grant direct sibling links.
+     `auth.agent.spawn`** (kind must be a configured sandboxed kind, default
+     `opencode`; args are validated by the sandbox wrapper), wait for and
+     inspect agent lifecycle, and close
+     panes/tabs **it owns** (pane ownership is tracked; list responses are
+     filtered). It cannot create plain panes and can *never* send raw shell/pty
+     input. It may report/release **its own pane** with `auth.report_self` /
+     `auth.release_self` (the pane is fixed by the token; no `resume_argv`).
+     Orchestration and results flow through messages, not `agent.prompt` or
+     `pane.read` scraping. It can mint scoped child tokens and grant direct
+     sibling links.
 - Works with your existing **bwrap sandbox wrapper** (e.g. an `opencode` wrapper
   that hides herdr's real socket in a mount namespace): it only needs to set
   `HERDR_SOCKET_PATH` to the proxy socket, pass `HERDR_AUTH_JWT` through, and
@@ -183,9 +187,10 @@ Additional rules:
 - `perm.agent_grants` is intersected with the global grantable set and the
   minter's grants. An orchestrator whose token has no `perm.agent_grants` may
   grant any advertised capability; set `perm.agent_grants` to narrow that
-  ceiling. `perm.agent_kinds` can only narrow the global sandboxed kind list
-  (`opencode`); it cannot widen it. `perm.mint_max_ttl_s` caps child TTL.
-  `perm` is only valid for orchestrator tokens; `grants` are only valid for
+  ceiling. `perm.agent_kinds` can only narrow the configured sandboxed kind list
+  (`sandboxed_agent_kinds`, default `["opencode"]`); it cannot widen it.
+  `perm.mint_max_ttl_s` caps child TTL. `perm` is only valid for orchestrator
+  tokens; `grants` are only valid for
   agent tokens. `mint_roles` no longer exists.
 - Child `exp` is clamped to the minter's `exp`, its `mint_max_ttl_s`, and the
   proxy-wide `max_token_ttl_s` (default 24 h). Agent tokens default to
@@ -208,7 +213,8 @@ herdr-auth whoami
 herdr-auth methods
 herdr-auth agent spawn --kind opencode --label foo \
   --grant report_status --grant read_own_pane -- --model sonnet
-herdr-auth token mint --role agent --pane w1:p2 --grant report_status
+herdr-auth token mint --role agent --pane w1:p2 --agent-kind opencode --grant report_status
+herdr-auth call auth.report_self --params '{"state":"working","agent":"opencode"}'
 herdr-auth call agent.list --params '{}'
 ```
 
@@ -256,11 +262,18 @@ allows both `pane.wait_for_output` and `agent.wait` on the agent's own pane
 (`target` is forced to its pane claim). Orchestrators may also call
 `pane.wait_for_output` on panes they own.
 
-An agent token is pinned to its pane and to the `opencode` reporting identity:
-a report for another pane is rejected, and `agent`/`source` cannot be changed.
-`pane.report_agent` accepts `idle | working | blocked | unknown`; `done` is
-derived by herdr's tool integration and is rejected by herdr itself.
-`resume_argv` is rejected for agent tokens (herdr would execute it on restore).
+An agent token is pinned to its pane and to the configured kind bound to the
+token (`agent_kind`, e.g. `opencode`): a report for another pane is rejected, and
+`agent`/`source` cannot be changed. `pane.report_agent` accepts
+`idle | working | blocked | unknown`; `done` is derived by herdr's tool
+integration and is rejected by herdr itself. `resume_argv` is rejected for
+agent tokens (herdr would execute it on restore).
+
+An orchestrator token can also be bound to the pane that minted it. It reports
+that pane through `auth.report_self` / `auth.release_self`; it cannot call
+`pane.report_agent` directly, target a different pane, or pass `resume_argv`.
+The opencode plugin path is unchanged: it keeps using its agent token and
+`pane.report_agent`/`pane.report_agent_session`.
 
 Start/stop together with the herdr server (no systemd unit):
 

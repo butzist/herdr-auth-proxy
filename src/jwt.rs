@@ -54,6 +54,10 @@ pub struct Claims {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
+    /// Sandboxed agent kind this token reports as (agent tokens only). Older
+    /// tokens omit it; callers fall back to the first sandboxed kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     /// The only working directory this token may create panes or start agents
     /// in. `None` means no directory is authorized (spawn paths fail closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,6 +168,7 @@ mod tests {
             exp: Some(now() + 60),
             role: Role::Agent,
             pane_id: Some("w1:p1".into()),
+            agent_kind: Some("opencode".into()),
             cwd: Some("/work".into()),
             workspace_id: Some("w1".into()),
             grants: vec!["report_status".into()],
@@ -179,6 +184,7 @@ mod tests {
         assert_eq!(verified.sub, "test");
         assert_eq!(verified.role, Role::Agent);
         assert_eq!(verified.pane_id.as_deref(), Some("w1:p1"));
+        assert_eq!(verified.agent_kind.as_deref(), Some("opencode"));
         assert_eq!(verified.cwd.as_deref(), Some("/work"));
         assert_eq!(verified.workspace_id.as_deref(), Some("w1"));
     }

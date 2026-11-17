@@ -36,8 +36,9 @@ just fmt           # cargo fmt
    non-admin role. `layout.apply` is denied (explicit argv = unsandboxed code as
    the herdr user). `pane.split`/`tab.create` are allowed only with the proxy as
    env authority (proxy-minted JWT injected, caller env stripped) and only the
-   `opencode` kind may be started; agent **args are validated by the sandbox
-   wrapper**, not the proxy.
+   configured sandboxed kinds (`sandboxed_agent_kinds`, default `opencode`) may
+   be started; agent **args are validated by the sandbox wrapper**, not the
+   proxy.
 5. **Child tokens are subsets.** Minting intersects permissions; `exp` is clamped
    to the minter's `exp`.
 6. **One pinned upstream connection per downstream connection** (streaming
@@ -63,6 +64,11 @@ just fmt           # cargo fmt
     revocable parent grant. Wake-up is idle-only and uses a fixed proxy prompt.
 12. **Fail closed on state errors.** An unopenable/corrupt `state.db` prevents
     the proxy from serving; no silent state reset. `state.json` is ignored.
+13. **Self-report only.** Orchestrators may report/release **the pane bound to
+    their token** through `auth.report_self` / `auth.release_self`. They cannot
+    call `pane.report_agent` directly, choose another pane, or pass
+    `resume_argv`; the opencode plugin keeps using its agent token and
+    `pane.report_agent`/`pane.report_agent_session`.
 
 ## Upstream reference
 

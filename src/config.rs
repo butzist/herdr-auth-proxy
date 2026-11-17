@@ -24,6 +24,11 @@ pub struct Config {
     pub death_grace_s: u64,
     /// Maximum `wait_ms` accepted by `auth.message.poll` / `.notify`.
     pub message_poll_max_ms: u64,
+    /// Agent kinds that have a sandbox wrapper. `agent.start` /
+    /// `auth.agent.spawn` may only start these, and agent tokens report as one
+    /// of them. A token's `perm.agent_kinds` may narrow this list, never widen
+    /// it. The first entry is the default reporting kind.
+    pub sandboxed_agent_kinds: Vec<String>,
     /// Claim lease for at-least-once delivery; unacked messages reappear.
     pub message_claim_lease_s: u64,
     /// Default lifetime of a queued message.
@@ -47,6 +52,7 @@ impl Default for Config {
             max_token_ttl_s: 86_400,
             death_grace_s: 15,
             message_poll_max_ms: 3_600_000,
+            sandboxed_agent_kinds: vec!["opencode".to_string()],
             message_claim_lease_s: 300,
             message_ttl_s: 86_400,
             message_max_bytes: 262_144,
@@ -57,6 +63,43 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Reject an unusable sandboxed-kind list instead of silently starting an
+    /// unsandboxed agent or minting an empty reporting identity.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.sandboxed_agent_kinds.is_empty() {
+            return Err("sandboxed_agent_kinds must not be empty".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in &self.sandboxed_agent_kinds {
+            let mut chars = kind.chars();
+            let valid = kind.len() <= 32
+                && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                && chars
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+            if !valid {
+                return Err(format!(
+                    "invalid sandboxed agent kind `{kind}` (expected [a-z][a-z0-9_-]{{0,31}})"
+                ));
+            }
+            if !seen.insert(kind.as_str()) {
+                return Err(format!("duplicate sandboxed agent kind `{kind}`"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reporting kind for tokens that do not carry an explicit `agent_kind`.
+    pub fn default_agent_kind(&self) -> Option<&str> {
+        self.sandboxed_agent_kinds.first().map(String::as_str)
+    }
+
+    pub fn allows_agent_kind(&self, kind: &str) -> bool {
+        self.sandboxed_agent_kinds
+            .iter()
+            .any(|allowed| allowed == kind)
+    }
+}
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
@@ -131,6 +174,7 @@ pub fn load() -> Result<(Config, Paths), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(error) => return Err(format!("read {}: {error}", config_path.display())),
     };
+    config.validate()?;
 
     let runtime = runtime_dir()?;
     let auth_socket = match &config.auth_socket {
@@ -168,5 +212,24 @@ mod tests {
         assert_eq!(config.message_poll_max_ms, 3_600_000);
         assert_eq!(config.message_claim_lease_s, 300);
         assert_eq!(config.message_max_bytes, 262_144);
+        assert_eq!(config.sandboxed_agent_kinds, vec!["opencode"]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn sandboxed_agent_kinds_are_validated() {
+        let with = |kinds: &[&str]| Config {
+            sandboxed_agent_kinds: kinds.iter().map(|kind| (*kind).to_string()).collect(),
+            ..Config::default()
+        };
+        assert!(with(&[]).validate().is_err());
+        assert!(with(&["opencode", "opencode"]).validate().is_err());
+        assert!(with(&["OpenCode"]).validate().is_err());
+
+        let config = with(&["opencode", "claude-code"]);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.default_agent_kind(), Some("opencode"));
+        assert!(config.allows_agent_kind("claude-code"));
+        assert!(!config.allows_agent_kind("unknown"));
     }
 }

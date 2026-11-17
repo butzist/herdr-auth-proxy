@@ -114,10 +114,8 @@ pub const KNOWN_METHODS: &[&str] = &[
 ];
 
 /// Minimal orchestrator workflow (default-deny everything else).
-/// Agent kinds that have a sandbox wrapper. A token's `agent_kinds` may narrow
-/// this list but never widen it: any other kind would run unsandboxed.
-pub const SANDBOXED_AGENT_KINDS: &[&str] = &["opencode"];
-
+/// Sandboxed agent kinds are configuration (`Config::sandboxed_agent_kinds`);
+/// a token's `agent_kinds` may narrow that list but never widen it.
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "ping",
     // The only way an orchestrator may create a pane/start an agent is the

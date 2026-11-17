@@ -585,7 +585,7 @@ fn tools() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "description": "Only `opencode` is sandboxed"},
+                    "kind": {"type": "string", "description": "Must be a sandboxed agent kind configured on the proxy"},
                     "name": {"type": "string"},
                     "cwd": {"type": "string", "description": "Must match the caller token cwd"},
                     "workspace_id": {"type": "string"},
