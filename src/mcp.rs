@@ -18,6 +18,13 @@ use crate::client;
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const NOTIFY_WAIT_MS: u64 = 25_000;
 
+/// `(targets, statuses by target, agent name by pane)`.
+type StatusSnapshot = (
+    Vec<String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+);
+
 const INSTRUCTIONS: &str = r#"herdr-auth MCP server
 
 You control sandboxed herdr agents through this server. Every tool call is
@@ -30,9 +37,21 @@ Messaging loop:
        from their shared parent.
   2. message-poll {wait_ms?, limit?} claims unread messages and returns them
      with a `claim_id`.
-  3. poll {wait_ms?, ...} waits for a message OR any owned child status change.
   3. message-ack {ids, claim_id} marks them done. Unacked claims become
      visible again after the lease expires.
+
+Waiting:
+  - Agents (developer/reviewer) may wait indefinitely: `wait_ms: 0` is allowed.
+  - Orchestrators are capped (default 30s). Never rely on an orchestrator
+    parking forever: prefer `watch` + `poll`, or end the turn and let the proxy
+    wake you.
+  - `watch {targets?, until?, ttl_s?}` returns immediately. The proxy monitors
+    the owned children and prompts you when a watched status changes; then call
+    `poll` to collect `changes`.
+  - `poll {wait_ms?, ...}` also returns queued watch changes. Its `waiting` map
+    tells you which agents are parked in a proxy wait (they are not deadlocked
+    silently).
+  - `agent-list` / `agent-get` add a `waiting` field for the same reason.
 
 Use `reply_to` and `thread_id` to keep request/response pairs together. Do not
 use pane.read or agent.prompt for orchestration; they are intentionally not
@@ -90,6 +109,11 @@ message was queued.
 `has_more` is true when the poll returned `limit` messages, meaning more may
 be queued for the caller. `claim_id` at the top level identifies the single
 claim for every message returned by that poll.
+
+Orchestrator waits are capped by `orchestrator_max_wait_ms` (default 30000);
+agent waits default to unlimited. A `waiting` entry in `poll`, `agent-list` or
+`agent-get` is proxy-side state: the agent is parked in a proxy wait, not busy
+working. `watch` is the non-blocking alternative to a long `poll`.
 "#;
 
 #[derive(Clone)]
@@ -195,15 +219,14 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
                     params[key] = value.clone();
                 }
             }
-            let wait = arguments
-                .get("timeout_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(options.timeout_ms);
-            (
-                "agent.wait",
-                params,
-                wait.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS),
-            )
+            // The proxy clamps this per role. An explicit 0 means "no client
+            // timeout": the proxy still returns at its role cap.
+            let timeout = match arguments.get("timeout_ms").and_then(Value::as_u64) {
+                Some(0) => 0,
+                Some(wait) => wait.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS),
+                None => options.timeout_ms,
+            };
+            ("agent.wait", params, timeout)
         }
         "agent-kill" => {
             let target = required(&arguments, "target")?;
@@ -247,25 +270,25 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
             ("auth.message.send", params, options.timeout_ms)
         }
         "message-poll" => {
-            let mut params = json!({});
-            for key in ["wait_ms", "limit"] {
-                if let Some(value) = arguments.get(key) {
-                    params[key] = value.clone();
-                }
-            }
-            let wait = arguments
-                .get("wait_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            (
-                "auth.message.poll",
-                params,
-                wait.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS),
-            )
+            return Ok(run_message_poll(options, &arguments));
         }
         "poll" => {
             return Ok(run_poll(options, &arguments));
         }
+        "watch" => {
+            let mut params = json!({});
+            for key in ["targets", "until", "ttl_s"] {
+                if let Some(value) = arguments.get(key) {
+                    params[key] = value.clone();
+                }
+            }
+            ("auth.watch.begin", params, options.timeout_ms)
+        }
+        "watch-cancel" => (
+            "auth.watch.end",
+            json!({"watch_id": required(&arguments, "watch_id")?}),
+            options.timeout_ms,
+        ),
         "message-ack" => (
             "auth.message.ack",
             json!({
@@ -305,10 +328,11 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
         Ok(response) => response,
         Err(error) => return Ok(tool_error(&error)),
     };
-    let result = match client::response_result(&response) {
+    let mut result = match client::response_result(&response) {
         Ok(result) => result,
         Err(error) => return Ok(tool_error(&error)),
     };
+    decorate_agent_waits(options, method, &mut result);
     let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -316,14 +340,210 @@ fn call_tool(options: &Options, params: &Value) -> Result<Value, (i64, String)> 
     }))
 }
 
-fn run_poll(options: &Options, arguments: &Value) -> Value {
-    use std::collections::BTreeMap;
-    use std::time::Instant;
+fn proxy_call(
+    options: &Options,
+    method: &str,
+    params: Value,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let response = client::exchange(
+        &options.socket,
+        options.token.as_deref(),
+        method,
+        params,
+        timeout_ms,
+    )?;
+    client::response_result(&response)
+}
 
-    let wait_ms = arguments
+/// Register the blocking wait with the proxy so orchestrators can tell
+/// `waiting` apart from `working`. The proxy returns the role-capped duration.
+fn begin_wait(options: &Options, kind: &str, wait_ms: u64) -> Result<(String, u64, bool), String> {
+    let result = proxy_call(
+        options,
+        "auth.wait.begin",
+        json!({"kind": kind, "wait_ms": wait_ms}),
+        options.timeout_ms,
+    )?;
+    let wait_id = result
+        .get("wait_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "auth.wait.begin returned no wait_id".to_string())?
+        .to_string();
+    let effective = result
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(wait_ms);
+    let capped = result
+        .get("capped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Ok((wait_id, effective, capped))
+}
+
+fn end_wait(options: &Options, wait_id: &str) {
+    let _ = proxy_call(
+        options,
+        "auth.wait.end",
+        json!({"wait_id": wait_id}),
+        options.timeout_ms,
+    );
+}
+
+fn tool_result(result: Value) -> Value {
+    let text = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+    json!({
+        "content": [{"type": "text", "text": text}],
+        "isError": false,
+    })
+}
+
+fn run_message_poll(options: &Options, arguments: &Value) -> Value {
+    let requested = arguments
+        .get("wait_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let (wait_id, wait_ms, capped) = match begin_wait(options, "message-poll", requested) {
+        Ok(wait) => wait,
+        Err(error) => return tool_error(&error),
+    };
+    let mut params = json!({"wait_ms": wait_ms});
+    if let Some(limit) = arguments.get("limit") {
+        params["limit"] = limit.clone();
+    }
+    // 0 means "no socket timeout"; the proxy still returns at the role cap.
+    let timeout = if wait_ms == 0 {
+        0
+    } else {
+        wait_ms.saturating_add(client::WAIT_TIMEOUT_MARGIN_MS)
+    };
+    let response = client::exchange(
+        &options.socket,
+        options.token.as_deref(),
+        "auth.message.poll",
+        params,
+        timeout,
+    );
+    end_wait(options, &wait_id);
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return tool_error(&error),
+    };
+    let mut result = match client::response_result(&response) {
+        Ok(result) => result,
+        Err(error) => return tool_error(&error),
+    };
+    if capped {
+        result["capped"] = json!(true);
+    }
+    tool_result(result)
+}
+
+/// Map waits to the agent names the caller already sees.
+fn waiting_json(options: &Options, panes: &std::collections::BTreeMap<String, String>) -> Value {
+    let Ok(result) = proxy_call(options, "auth.agent.waits", json!({}), options.timeout_ms) else {
+        return json!({});
+    };
+    let mut out = serde_json::Map::new();
+    for wait in result
+        .get("waits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(pane) = wait
+            .get("pane_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let key = panes.get(&pane).cloned().unwrap_or(pane);
+        out.insert(key, wait);
+    }
+    Value::Object(out)
+}
+
+/// Collect status changes recorded by `auth.watch.begin`.
+fn drain_watches(options: &Options) -> Vec<Value> {
+    let Ok(result) = proxy_call(options, "auth.watch.drain", json!({}), options.timeout_ms) else {
+        return Vec::new();
+    };
+    result
+        .get("watches")
+        .and_then(Value::as_array)
+        .map(|watches| {
+            watches
+                .iter()
+                .filter_map(|watch| watch.get("changes").and_then(Value::as_array))
+                .flatten()
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn decorate_agent_waits(options: &Options, method: &str, result: &mut Value) {
+    if !matches!(method, "agent.list" | "agent.get") {
+        return;
+    }
+    let Ok(waits) = proxy_call(options, "auth.agent.waits", json!({}), options.timeout_ms) else {
+        return;
+    };
+    let waits = waits
+        .get("waits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let waiting_for = |pane: &str| {
+        waits
+            .iter()
+            .find(|wait| wait.get("pane_id").and_then(Value::as_str) == Some(pane))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    if method == "agent.list" {
+        if let Some(agents) = result.get_mut("agents").and_then(Value::as_array_mut) {
+            for agent in agents {
+                let pane = agent
+                    .get("pane_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let waiting = pane.as_deref().map(waiting_for).unwrap_or(Value::Null);
+                agent["waiting"] = waiting;
+            }
+        }
+        return;
+    }
+    let pane = result
+        .pointer("/agent/pane_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let waiting = pane.as_deref().map(waiting_for).unwrap_or(Value::Null);
+    if let Some(agent) = result.get_mut("agent") {
+        agent["waiting"] = waiting.clone();
+    }
+    result["waiting"] = waiting;
+}
+
+fn run_poll(options: &Options, arguments: &Value) -> Value {
+    let requested = arguments
         .get("wait_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
+    let (wait_id, wait_ms, _capped) = match begin_wait(options, "poll", requested) {
+        Ok(wait) => wait,
+        Err(error) => return tool_error(&error),
+    };
+    let out = run_poll_inner(options, arguments, wait_ms);
+    end_wait(options, &wait_id);
+    out
+}
+
+fn run_poll_inner(options: &Options, arguments: &Value, wait_ms: u64) -> Value {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
     let limit = arguments
         .get("limit")
         .and_then(Value::as_u64)
@@ -363,9 +583,7 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
 
     // initial statuses
     // helper closure to fetch statuses
-    let fetch = |opts: &Options,
-                 filter: &Vec<String>|
-     -> Result<(Vec<String>, BTreeMap<String, String>), String> {
+    let fetch = |opts: &Options, filter: &Vec<String>| -> Result<StatusSnapshot, String> {
         let resp = client::exchange(
             &opts.socket,
             opts.token.as_deref(),
@@ -381,12 +599,16 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
             .unwrap_or_default();
         let mut targets = Vec::new();
         let mut statuses = BTreeMap::new();
+        let mut names = BTreeMap::new();
         for agent in agents {
             let name = agent.get("name").and_then(Value::as_str).map(str::to_owned);
             let pane = agent
                 .get("pane_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            if let (Some(pane), Some(name)) = (&pane, &name) {
+                names.insert(pane.clone(), name.clone());
+            }
             let target = name.clone().or(pane.clone());
             let Some(target) = target else {
                 continue;
@@ -423,14 +645,28 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
             };
             statuses.insert(target, status);
         }
-        Ok((targets, statuses))
+        Ok((targets, statuses, names))
     };
 
-    let (_initial_targets, initial_statuses) = match fetch(options, &targets_filter) {
+    let (_initial_targets, initial_statuses, names) = match fetch(options, &targets_filter) {
         Ok(v) => v,
         Err(e) => return tool_error(&e),
     };
     let initial = initial_statuses;
+
+    // A fired watch already has changes relative to an earlier baseline; return
+    // them immediately so the wake-up is not lost.
+    let mut watch_changes = drain_watches(options);
+    if !watch_changes.is_empty() {
+        return tool_result(json!({
+            "timed_out": false,
+            "waited_ms": 0,
+            "messages": [],
+            "changes": watch_changes,
+            "statuses": initial,
+            "waiting": waiting_json(options, &names),
+        }));
+    }
 
     loop {
         // check messages
@@ -461,18 +697,21 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
                     .unwrap_or_default();
                 if !msgs.is_empty() {
                     let waited = start.elapsed().as_millis() as u64;
+                    let mut changes = std::mem::take(&mut watch_changes);
+                    changes.extend(drain_watches(options));
                     let mut out = json!({
                         "timed_out": false,
                         "waited_ms": waited,
                         "messages": msgs,
                         "claim_id": result.get("claim_id"),
-                        "changes": [],
+                        "changes": changes,
                     });
                     // statuses
-                    if let Ok((_, statuses)) = fetch(options, &targets_filter) {
+                    if let Ok((_, statuses, names)) = fetch(options, &targets_filter) {
                         out["statuses"] = json!(statuses);
+                        out["waiting"] = waiting_json(options, &names);
                     }
-                    return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+                    return tool_result(out);
                 }
             }
         } else {
@@ -489,13 +728,15 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
         }
 
         // refresh statuses
-        let (_cur_targets, cur_statuses) = match fetch(options, &targets_filter) {
+        let (_cur_targets, cur_statuses, cur_names) = match fetch(options, &targets_filter) {
             Ok(v) => v,
             Err(e) => return tool_error(&e),
         };
+        let waiting = waiting_json(options, &cur_names);
 
         // detect changes against initial (and removed)
-        let mut changes = Vec::new();
+        let mut changes = std::mem::take(&mut watch_changes);
+        changes.extend(drain_watches(options));
         let mut all_keys: std::collections::BTreeSet<String> = initial.keys().cloned().collect();
         for k in cur_statuses.keys() {
             all_keys.insert(k.clone());
@@ -520,23 +761,27 @@ fn run_poll(options: &Options, arguments: &Value) -> Value {
                 "messages": [],
                 "changes": changes,
                 "statuses": cur_statuses,
+                "waiting": waiting,
             });
-            return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+            return tool_result(out);
         }
-
         // timeout check
         if let Some(dl) = deadline
             && Instant::now() >= dl
         {
             let waited = start.elapsed().as_millis() as u64;
+            let mut changes = std::mem::take(&mut watch_changes);
+            changes.extend(drain_watches(options));
+            let timed_out = changes.is_empty();
             let out = json!({
-                "timed_out": true,
+                "timed_out": timed_out,
                 "waited_ms": waited,
                 "messages": [],
-                "changes": [],
+                "changes": changes,
                 "statuses": cur_statuses,
+                "waiting": waiting,
             });
-            return json!({"content":[{"type":"text","text": serde_json::to_string_pretty(&out).unwrap_or_default()}],"isError":false});
+            return tool_result(out);
         }
     }
 }
@@ -614,7 +859,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "agent-wait",
-            "Wait for an owned agent to reach a lifecycle state.",
+            "Wait for an owned agent to reach a lifecycle state. Orchestrator timeouts are capped (default 30s); use `watch` instead of parking.",
             json!({
                 "type": "object",
                 "properties": {
@@ -669,7 +914,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "message-poll",
-            "Claim unread messages. Long-polls until a message arrives or wait_ms expires.",
+            "Claim unread messages. wait_ms=0 waits as long as your role allows: agents may wait indefinitely, orchestrators are capped (default 30s).",
             json!({
                 "type": "object",
                 "properties": {
@@ -680,16 +925,37 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "poll",
-            "Wait for a message or any owned child status change (idle, killed, question, ...). Long-polls up to wait_ms (0 = indefinitely).",
+            "Collect messages, fired watch changes, and owned child status changes. wait_ms=0 waits up to your role cap (or indefinitely for agents). Orchestrators should prefer `watch` + a short `poll`.",
             json!({
                 "type": "object",
                 "properties": {
-                    "wait_ms": {"type": "integer", "description": "Maximum wait in ms; 0 waits indefinitely"},
+                    "wait_ms": {"type": "integer", "description": "Maximum wait in ms; 0 = role cap (or indefinitely for agents)"},
                     "limit": {"type": "integer"},
                     "messages": {"type": "boolean", "description": "Also wait for and claim incoming messages"},
                     "targets": {"type": "array", "items": {"type": "string"}, "description": "Agent names/pane ids to watch; default all owned"},
                     "until": {"type": "array", "items": {"type": "string"}, "description": "Only trigger on these child statuses"}
                 }
+            }),
+        ),
+        tool(
+            "watch",
+            "Register a non-blocking watch on owned children. Returns immediately; the proxy prompts you (when idle) on a matching change. Call `poll` afterwards. Prefer this over a long `poll`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "targets": {"type": "array", "items": {"type": "string"}, "description": "Agent names/pane ids; default all owned children"},
+                    "until": {"type": "array", "items": {"type": "string"}, "description": "Only trigger on these statuses (idle, done, blocked, unknown, killed)"},
+                    "ttl_s": {"type": "integer", "description": "Watch lifetime in seconds (default 600, max 3600)"}
+                }
+            }),
+        ),
+        tool(
+            "watch-cancel",
+            "Cancel a watch before it fires or expires.",
+            json!({
+                "type": "object",
+                "properties": {"watch_id": {"type": "string"}},
+                "required": ["watch_id"]
             }),
         ),
         tool(
@@ -901,5 +1167,169 @@ mod tests {
                 .unwrap()
                 .contains("peer-grant")
         );
+    }
+
+    /// Minimal blocking proxy for the client-side `poll` / `message-poll`
+    /// flows. Records every method call so the tests can assert ordering.
+    struct FakeProxy {
+        dir: PathBuf,
+        socket: PathBuf,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        calls: std::sync::Arc<Mutex<Vec<(String, Value)>>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeProxy {
+        fn new(handler: impl Fn(&str, &Value) -> Value + Send + 'static) -> Self {
+            let dir = std::env::temp_dir().join(format!("hap-mcp-{}", crate::jwt::random_id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let socket = dir.join("auth.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let thread_stop = stop.clone();
+            let thread_calls = calls.clone();
+            let handle = thread::spawn(move || {
+                while !thread_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(500)))
+                                .ok();
+                            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                continue;
+                            }
+                            let Ok(request) = serde_json::from_str::<Value>(line.trim()) else {
+                                continue;
+                            };
+                            let method = request
+                                .get("method")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            let params = request.get("params").cloned().unwrap_or(json!({}));
+                            thread_calls
+                                .lock()
+                                .unwrap()
+                                .push((method.clone(), params.clone()));
+                            let result = handler(&method, &params);
+                            let id = request.get("id").cloned().unwrap_or(Value::Null);
+                            let response = match result.get("__error").and_then(Value::as_str) {
+                                Some(error) => {
+                                    json!({"id": id, "error": {"code": "error", "message": error}})
+                                }
+                                None => json!({"id": id, "result": result}),
+                            };
+                            let _ = writeln!(stream, "{response}");
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                dir,
+                socket,
+                stop,
+                calls,
+                handle: Some(handle),
+            }
+        }
+
+        fn options(&self) -> Options {
+            Options {
+                socket: self.socket.clone(),
+                token: None,
+                timeout_ms: 2_000,
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, _)| method.clone())
+                .collect()
+        }
+    }
+
+    impl Drop for FakeProxy {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn result_text(value: &Value) -> Value {
+        let text = value["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn message_poll_registers_uses_and_ends_the_capped_wait() {
+        let proxy = FakeProxy::new(|method, _| match method {
+            "auth.wait.begin" => json!({"wait_id": "w-1", "wait_ms": 1_000, "capped": true}),
+            "auth.message.poll" => json!({"messages": [], "timed_out": true}),
+            "auth.wait.end" => json!({"ended": true}),
+            _ => json!({"__error": "unexpected"}),
+        });
+        let out = run_message_poll(&proxy.options(), &json!({"wait_ms": 0}));
+        assert_eq!(result_text(&out)["timed_out"], json!(true));
+        assert_eq!(result_text(&out)["capped"], json!(true));
+        assert_eq!(
+            proxy.methods(),
+            vec!["auth.wait.begin", "auth.message.poll", "auth.wait.end"]
+        );
+        let calls = proxy.calls.lock().unwrap();
+        assert_eq!(calls[0].1["kind"], json!("message-poll"));
+        assert_eq!(calls[1].1["wait_ms"], json!(1_000));
+    }
+
+    #[test]
+    fn poll_with_zero_wait_returns_at_the_effective_cap_instead_of_hanging() {
+        let proxy = FakeProxy::new(|method, _| match method {
+            "auth.wait.begin" => json!({"wait_id": "w-2", "wait_ms": 1, "capped": true}),
+            "auth.watch.drain" => json!({"watches": []}),
+            "auth.message.poll" => json!({"messages": [], "timed_out": true}),
+            "auth.agent.waits" => json!({"waits": []}),
+            "agent.list" => json!({"agents": []}),
+            "agent.get" => json!({"__error": "unexpected"}),
+            "auth.wait.end" => json!({"ended": true}),
+            _ => json!({"__error": "unexpected"}),
+        });
+        let started = std::time::Instant::now();
+        let out = run_poll(&proxy.options(), &json!({"wait_ms": 0}));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(result_text(&out)["timed_out"], json!(true));
+        assert!(proxy.methods().contains(&"auth.message.poll".to_string()));
+        assert_eq!(proxy.methods().last().unwrap(), "auth.wait.end");
+    }
+
+    #[test]
+    fn poll_returns_a_fired_watch_without_blocking() {
+        let proxy = FakeProxy::new(|method, _| match method {
+            "auth.wait.begin" => json!({"wait_id": "w-3", "wait_ms": 0, "capped": false}),
+            "auth.watch.drain" => json!({"watches": [{
+                "watch_id": "watch-1",
+                "changes": [{"target": "worker", "pane_id": "w1:p2", "from": "working", "to": "idle"}]
+            }]}),
+            "agent.list" => json!({"agents": []}),
+            "auth.wait.end" => json!({"ended": true}),
+            _ => json!({"__error": "unexpected"}),
+        });
+        let out = run_poll(&proxy.options(), &json!({"wait_ms": 0}));
+        let out = result_text(&out);
+        assert_eq!(out["timed_out"], json!(false));
+        assert_eq!(out["changes"][0]["to"], json!("idle"));
+        assert!(!proxy.methods().contains(&"auth.message.poll".to_string()));
     }
 }

@@ -7,6 +7,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::jwt::Role;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -22,8 +24,18 @@ pub struct Config {
     pub max_token_ttl_s: u64,
     /// How long the upstream socket may be unreachable before the proxy exits.
     pub death_grace_s: u64,
-    /// Maximum `wait_ms` accepted by `auth.message.poll` / `.notify`.
+    /// Global hard cap for every blocking wait (`0` = no global cap). The
+    /// per-role caps below are applied first and then intersected with this.
     pub message_poll_max_ms: u64,
+    /// Maximum blocking wait for orchestrator tokens (`0` = unlimited).
+    /// Orchestrators coordinate around children, so they must not park
+    /// indefinitely while a child waits for them (deadlock).
+    pub orchestrator_max_wait_ms: u64,
+    /// Maximum blocking wait for agent tokens (`0` = unlimited). Developers and
+    /// reviewers may wait for input indefinitely.
+    pub agent_max_wait_ms: u64,
+    /// Maximum blocking wait for admin tokens (`0` = unlimited).
+    pub admin_max_wait_ms: u64,
     /// Agent kinds that have a sandbox wrapper. `agent.start` /
     /// `auth.agent.spawn` may only start these, and agent tokens report as one
     /// of them. A token's `perm.agent_kinds` may narrow this list, never widen
@@ -51,7 +63,10 @@ impl Default for Config {
             agent_ttl_s: 86_400,
             max_token_ttl_s: 86_400,
             death_grace_s: 15,
-            message_poll_max_ms: 3_600_000,
+            message_poll_max_ms: 0,
+            orchestrator_max_wait_ms: 30_000,
+            agent_max_wait_ms: 0,
+            admin_max_wait_ms: 0,
             sandboxed_agent_kinds: vec!["opencode".to_string()],
             message_claim_lease_s: 300,
             message_ttl_s: 86_400,
@@ -60,6 +75,14 @@ impl Default for Config {
             message_wakeup_min_interval_s: 30,
             message_stale_s: 120,
         }
+    }
+}
+
+fn min_cap(a: u64, b: u64) -> u64 {
+    match (a, b) {
+        (0, b) => b,
+        (a, 0) => a,
+        (a, b) => a.min(b),
     }
 }
 
@@ -98,6 +121,27 @@ impl Config {
         self.sandboxed_agent_kinds
             .iter()
             .any(|allowed| allowed == kind)
+    }
+
+    /// Effective blocking-wait cap for a role. `0` means unlimited.
+    pub fn max_wait_ms(&self, role: Role) -> u64 {
+        let role_cap = match role {
+            Role::Orchestrator => self.orchestrator_max_wait_ms,
+            Role::Agent => self.agent_max_wait_ms,
+            Role::Admin => self.admin_max_wait_ms,
+        };
+        min_cap(role_cap, self.message_poll_max_ms)
+    }
+
+    /// Clamp a requested wait to the role cap. Returns `(effective_ms, capped)`.
+    /// `0` means "wait indefinitely" and is clamped for capped roles.
+    pub fn clamp_wait_ms(&self, role: Role, requested_ms: u64) -> (u64, bool) {
+        let cap = self.max_wait_ms(role);
+        if cap > 0 && (requested_ms == 0 || requested_ms > cap) {
+            (cap, true)
+        } else {
+            (requested_ms, false)
+        }
     }
 }
 #[derive(Debug, Clone)]
@@ -209,7 +253,7 @@ mod tests {
         assert_eq!(config.agent_ttl_s, 86_400);
         assert_eq!(config.max_token_ttl_s, 86_400);
         assert_eq!(config.death_grace_s, 15);
-        assert_eq!(config.message_poll_max_ms, 3_600_000);
+        assert_eq!(config.message_poll_max_ms, 0);
         assert_eq!(config.message_claim_lease_s, 300);
         assert_eq!(config.message_max_bytes, 262_144);
         assert_eq!(config.sandboxed_agent_kinds, vec!["opencode"]);
@@ -231,5 +275,34 @@ mod tests {
         assert_eq!(config.default_agent_kind(), Some("opencode"));
         assert!(config.allows_agent_kind("claude-code"));
         assert!(!config.allows_agent_kind("unknown"));
+    }
+
+    #[test]
+    fn orchestrator_waits_are_capped_agents_may_wait_forever() {
+        let config = Config::default();
+        assert_eq!(config.clamp_wait_ms(Role::Orchestrator, 0), (30_000, true));
+        assert_eq!(
+            config.clamp_wait_ms(Role::Orchestrator, 5_000),
+            (5_000, false)
+        );
+        assert_eq!(
+            config.clamp_wait_ms(Role::Orchestrator, 90_000),
+            (30_000, true)
+        );
+        assert_eq!(config.clamp_wait_ms(Role::Agent, 0), (0, false));
+        assert_eq!(config.clamp_wait_ms(Role::Agent, 900_000), (900_000, false));
+        assert_eq!(config.clamp_wait_ms(Role::Admin, 0), (0, false));
+    }
+
+    #[test]
+    fn global_cap_intersects_with_the_role_cap() {
+        let config = Config {
+            message_poll_max_ms: 10_000,
+            ..Config::default()
+        };
+        assert_eq!(config.max_wait_ms(Role::Orchestrator), 10_000);
+        assert_eq!(config.max_wait_ms(Role::Agent), 10_000);
+        // A per-role cap of zero means "no role cap"; the global cap wins.
+        assert_eq!(config.clamp_wait_ms(Role::Agent, 0), (10_000, true));
     }
 }

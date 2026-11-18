@@ -230,8 +230,8 @@ herdr-auth mcp
 
 Tools: `agent-spawn`, `agent-list`, `agent-get`, `agent-wait`, `agent-kill`,
 `message-send`, `message-poll`, `message-ack`, `message-status`,
-`peer-grant`, `peer-revoke`, `peer-list`, `whoami`, plus **admin-only**
-`agent-read`.
+`watch`, `watch-cancel`, `poll`, `peer-grant`, `peer-revoke`, `peer-list`,
+`whoami`, plus **admin-only** `agent-read`.
 
 Messaging is the orchestration path (no `agent.prompt` / `pane.read` in the
 normal workflow):
@@ -247,6 +247,14 @@ Relationship rules: parent ⇄ child always; siblings need a direct, non-transit
 revocable `peer-grant` from their shared parent. Idle workers get an MCP
 notification and, if they still have unpolled mail, a fixed proxy-generated
 `agent.prompt` nudge after a configurable timeout.
+
+Blocking waits are role-capped: orchestrators default to 30 s
+(`orchestrator_max_wait_ms`), while agent tokens may wait indefinitely
+(`agent_max_wait_ms = 0`). Orchestrators should use `watch` instead of parking:
+it returns immediately and the proxy wakes the idle orchestrator when a watched
+child changes state; the next `poll` returns the queued `changes`. `poll`,
+`agent-list`, and `agent-get` include a `waiting` field so a parked agent is not
+mistaken for a busy one. herdr's own lifecycle is never rewritten.
 
 Start/stop together with the herdr server (no systemd unit):
 

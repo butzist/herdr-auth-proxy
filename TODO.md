@@ -45,6 +45,17 @@ integration tests against a real herdr.
       tools; keep admin-only `pane.read` / `agent-read` escape hatch.
 - [x] Update AGENTS.md invariants. ARCHITECTURE.md updated for the messaging
       model (further refinement may follow real-world validation).
+- [x] Wait/deadlock fix: per-role blocking-wait caps
+      (`orchestrator_max_wait_ms` default 30 s, `agent_max_wait_ms` unlimited),
+      applied to `auth.message.poll`/`notify` and `agent.wait` /
+      `pane.wait_for_output`; generic `poll` honours the effective cap. Added
+      `auth.wait.begin/end`, `auth.agent.waits`, the `waiting` field on
+      `poll`/`agent-list`/`agent-get`, and non-blocking `auth.watch.*`
+      (`watch` MCP tool) with an idle-only fixed wake-up prompt.
+- [ ] Live-validate the `watch` wake-up path with a real opencode MCP client
+      (prompt delivery while idle, `poll` drains recorded changes).
+- [ ] Bound server-side infinite waits to the token lifetime (or detect peer
+      disconnect) so a dead client cannot leave a poll task running forever.
 
 ## Phase 0 — scaffold
 

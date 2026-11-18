@@ -148,6 +148,13 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "auth.message.peer.grant",
     "auth.message.peer.revoke",
     "auth.message.peer.list",
+    // proxy wait/watch state (role-capped; auth.* is dispatched locally)
+    "auth.wait.begin",
+    "auth.wait.end",
+    "auth.agent.waits",
+    "auth.watch.begin",
+    "auth.watch.end",
+    "auth.watch.drain",
 ];
 
 pub fn is_known(method: &str) -> bool {

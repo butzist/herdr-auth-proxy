@@ -19,3 +19,4 @@ pub mod server;
 pub mod state;
 pub mod store;
 pub mod upstream;
+pub mod waits;

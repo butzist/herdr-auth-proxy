@@ -485,6 +485,9 @@ NDJSON codec:
 | `auth.report_self` / `auth.release_self` | report/release the pane bound to an orchestrator token; pane is fixed by the token, `resume_argv` is rejected, and `agent` must be in the token's `perm.agent_kinds` |
 | `auth.message.send` / `poll` / `ack` / `notify` / `status` | durable parent⇄child and granted-sibling messaging (JWT-gated, relationship-checked, claim/ack delivery) |
 | `auth.message.peer.grant` / `revoke` / `list` | direct, non-transitive, revocable sibling links between a parent's own children |
+| `auth.wait.begin` / `end` | record a blocking wait (kind: `poll`, `message-poll`, `watch`) so it is visible as `waiting`; the proxy returns the role-capped duration |
+| `auth.agent.waits` | list waits for the caller and its owned panes |
+| `auth.watch.begin` / `end` / `drain` | non-blocking lifecycle watch on owned children; the proxy prompts the (idle) waiter and queues the change for `poll` |
 
 `auth.agent.spawn` params: `kind`, `args`, optional `name`, `label`, `focus`,
 `ttl_s`, `grants` (agent tokens never carry `perm`, so it is rejected). The
@@ -599,7 +602,25 @@ sandboxed_agent_kinds = ["opencode"]
 # messaging (see MCP_MESSAGING_PLAN.md): message_poll_max_ms,
 # message_claim_lease_s, message_ttl_s, message_max_bytes,
 # message_wakeup_after_s, message_wakeup_min_interval_s, message_stale_s
+# waiting: 0 = unlimited for that role/global
+message_poll_max_ms = 0             # global cap (0 = none)
+orchestrator_max_wait_ms = 30000    # orchestrators must never park forever
+agent_max_wait_ms = 0               # developers/reviewers may wait forever
+admin_max_wait_ms = 0
 ```
+
+**Waiting, watches, and deadlocks.** herdr's lifecycle only has
+`idle|working|blocked|done|unknown`; an agent parked in a long poll is
+`working`, so `agent.wait` can deadlock against a child that waits for the
+parent. The proxy therefore caps orchestrator blocking waits (default 30 s) and
+records active waits. `auth.agent.waits` (and the `waiting` field added to
+`poll`, `agent-list`, `agent-get`) distinguishes "parked in a proxy wait" from
+"busy working" without rewriting herdr's lifecycle. Orchestrators should use
+`auth.watch.begin` instead of a long poll: it returns immediately, the proxy
+monitors the owned children, and once the watcher is idle it is prompted with a
+fixed string; the next `poll` drains the recorded `changes`. Agent tokens may
+still wait indefinitely. Waits/watches are in-memory (transient by nature) and
+expire; they are not part of `state.db`.
 
 The signing key is never persisted. Durable state lives in
 `$XDG_STATE_HOME/herdr-auth-proxy/state.db` (`state.json` ignored); the auth

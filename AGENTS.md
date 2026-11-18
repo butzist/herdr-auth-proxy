@@ -62,6 +62,10 @@ just fmt           # cargo fmt
     at-least-once: a claim lease must be acked; unacked messages reappear.
     Parent ⇄ child is always allowed; siblings require a direct, non-transitive,
     revocable parent grant. Wake-up is idle-only and uses a fixed proxy prompt.
+    Blocking waits are role-capped (`orchestrator_max_wait_ms`, default 30 s;
+    agents may wait indefinitely). Never fake herdr's lifecycle: expose parked
+    waits via `auth.agent.waits` / `waiting`, and use `auth.watch.*` (idle-only
+    fixed prompt) instead of a long orchestrator poll.
 12. **Fail closed on state errors.** An unopenable/corrupt `state.db` prevents
     the proxy from serving; no silent state reset. `state.json` is ignored.
 13. **Self-report only.** Orchestrators may report/release **the pane bound to

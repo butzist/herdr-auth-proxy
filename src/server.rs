@@ -14,6 +14,7 @@ use crate::config::Paths;
 use crate::jwt::{Claims, Perm, Role};
 use crate::mail::MailHub;
 use crate::store::{Message, NewMessage, Principal, Store};
+use crate::waits::{WaitGuard, WaitHub, Watch, WatchHub};
 use crate::{config, cwd, environ, grants, jwt, keys, policy, protocol, state::State, upstream};
 
 struct Ctx {
@@ -23,6 +24,8 @@ struct Ctx {
     state: Mutex<State>,
     store: Store,
     mail: Arc<MailHub>,
+    waits: Arc<WaitHub>,
+    watches: Arc<WatchHub>,
     bootstrap_jti: String,
 }
 
@@ -60,6 +63,8 @@ pub async fn run() -> Result<(), String> {
         state: Mutex::new(state),
         store,
         mail: Arc::new(MailHub::new()),
+        waits: Arc::new(WaitHub::new()),
+        watches: Arc::new(WatchHub::new()),
         bootstrap_jti,
     });
 
@@ -84,6 +89,7 @@ pub async fn run() -> Result<(), String> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     spawn_signal_handler(shutdown_tx.clone());
     spawn_watchdog(ctx.clone(), shutdown_tx);
+    spawn_watch_monitor(ctx.clone());
 
     loop {
         tokio::select! {
@@ -468,6 +474,21 @@ async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> Strin
                     "auth.message.peer.list",
                 ],
                 "self_report": ["auth.report_self", "auth.release_self"],
+                "waits": [
+                    "auth.wait.begin",
+                    "auth.wait.end",
+                    "auth.agent.waits",
+                ],
+                "watches": [
+                    "auth.watch.begin",
+                    "auth.watch.end",
+                    "auth.watch.drain",
+                ],
+                "max_wait_ms": {
+                    "orchestrator": ctx.cfg.max_wait_ms(Role::Orchestrator),
+                    "agent": ctx.cfg.max_wait_ms(Role::Agent),
+                    "admin": ctx.cfg.max_wait_ms(Role::Admin),
+                },
                 "admin_only": ["pane.read"],
             })),
             "auth.token.mint" => mint(ctx, identity, &params).await,
@@ -482,6 +503,12 @@ async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> Strin
             "auth.message.peer.list" => peer_list(ctx, identity, &params).await,
             "auth.report_self" => report_self(ctx, identity, &params, false).await,
             "auth.release_self" => report_self(ctx, identity, &params, true).await,
+            "auth.wait.begin" => wait_begin(ctx, identity, &params),
+            "auth.wait.end" => wait_end(ctx, identity, &params),
+            "auth.agent.waits" => agent_waits(ctx, identity, &params).await,
+            "auth.watch.begin" => watch_begin(ctx, identity, &params).await,
+            "auth.watch.end" => watch_end(ctx, identity, &params),
+            "auth.watch.drain" => watch_drain(ctx, identity),
             _ => Err((
                 "unknown_method".to_string(),
                 "unknown auth method".to_string(),
@@ -670,6 +697,30 @@ async fn dispatch(ctx: &Arc<Ctx>, identity: &Identity, request: &Value) -> Strin
             );
         }
         pending_jti = Some(jti);
+    }
+
+    // Role caps apply to herdr's own blocking waits too, not only to the
+    // proxy's messaging tools. An orchestrator must never park indefinitely.
+    let mut _wait_guard: Option<WaitGuard> = None;
+    if matches!(method.as_str(), "agent.wait" | "pane.wait_for_output") {
+        clamp_wait_params(ctx, identity, &mut params);
+        let wait_ms = params
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let kind = if method == "agent.wait" {
+            "agent-wait"
+        } else {
+            "pane-wait"
+        };
+        let wait_id = ctx.waits.begin_if_absent(
+            &identity.sub,
+            &identity.jti,
+            identity.pane_id.as_deref(),
+            kind,
+            crate::waits::wait_ttl_s(wait_ms),
+        );
+        _wait_guard = Some(WaitGuard::new(ctx.waits.clone(), &identity.jti, wait_id));
     }
 
     let upstream_id = format!("proxy-{}", jwt::random_id());
@@ -1621,6 +1672,244 @@ fn internal(error: String) -> (String, String) {
     ("internal".to_string(), error)
 }
 
+fn clamp_wait_params(ctx: &Ctx, identity: &Identity, params: &mut Value) {
+    let cap = ctx.cfg.max_wait_ms(identity.role);
+    if cap == 0 {
+        return;
+    }
+    let requested = params
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if requested == 0 || requested > cap {
+        params["timeout_ms"] = json!(cap);
+    }
+}
+
+fn wait_begin(
+    ctx: &Arc<Ctx>,
+    identity: &Identity,
+    params: &Value,
+) -> Result<Value, (String, String)> {
+    let kind = params.get("kind").and_then(Value::as_str).unwrap_or("poll");
+    if !crate::waits::WAIT_KINDS.contains(&kind) {
+        return Err((
+            "invalid_param".to_string(),
+            format!(
+                "kind must be one of {}",
+                crate::waits::WAIT_KINDS.join(", ")
+            ),
+        ));
+    }
+    let requested = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
+    let (wait_ms, capped) = ctx.cfg.clamp_wait_ms(identity.role, requested);
+    let wait_id = ctx.waits.begin(
+        &identity.sub,
+        &identity.jti,
+        identity.pane_id.as_deref(),
+        kind,
+        crate::waits::wait_ttl_s(wait_ms),
+    );
+    Ok(json!({
+        "wait_id": wait_id,
+        "kind": kind,
+        "wait_ms": wait_ms,
+        "capped": capped,
+        "max_wait_ms": ctx.cfg.max_wait_ms(identity.role),
+    }))
+}
+
+fn wait_end(
+    ctx: &Arc<Ctx>,
+    identity: &Identity,
+    params: &Value,
+) -> Result<Value, (String, String)> {
+    let wait_id = require_str(params, "wait_id")?;
+    Ok(json!({ "ended": ctx.waits.end(&identity.jti, wait_id) }))
+}
+
+async fn agent_waits(
+    ctx: &Arc<Ctx>,
+    identity: &Identity,
+    params: &Value,
+) -> Result<Value, (String, String)> {
+    let include_self = params
+        .get("include_self")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let waits = ctx.waits.list(jwt::now());
+    let state = ctx.state.lock().await;
+    let visible: Vec<Value> = waits
+        .into_iter()
+        .filter(|wait| {
+            if wait.jti == identity.jti {
+                return include_self || identity.role == Role::Admin;
+            }
+            identity.role == Role::Admin
+                || wait
+                    .pane_id
+                    .as_deref()
+                    .is_some_and(|pane| state.owns_pane(pane, &identity.sub))
+        })
+        .map(|wait| wait.to_json())
+        .collect();
+    Ok(json!({ "waits": visible }))
+}
+
+async fn watch_begin(
+    ctx: &Arc<Ctx>,
+    identity: &Identity,
+    params: &Value,
+) -> Result<Value, (String, String)> {
+    if identity.role == Role::Agent {
+        return Err((
+            "forbidden".to_string(),
+            "agents cannot watch other agents; use messages".to_string(),
+        ));
+    }
+    let pane_id = identity.pane_id.clone().ok_or_else(|| {
+        (
+            "forbidden".to_string(),
+            "watch requires a pane-bound token to receive the wake-up".to_string(),
+        )
+    })?;
+
+    let until = string_array(params, "until");
+    if let Some(bad) = until
+        .iter()
+        .find(|status| !crate::waits::WATCH_STATUSES.contains(&status.as_str()))
+    {
+        return Err((
+            "invalid_param".to_string(),
+            format!("unknown watch status `{bad}`"),
+        ));
+    }
+    let targets = string_array(params, "targets");
+    let ttl_s = params
+        .get("ttl_s")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::waits::WATCH_DEFAULT_TTL_S)
+        .clamp(1, crate::waits::WATCH_MAX_TTL_S);
+
+    let result = upstream::request(
+        &ctx.paths.upstream_socket,
+        "agent.list",
+        json!({}),
+        "watch-begin",
+    )
+    .await
+    .map_err(internal)?;
+    let agents = result
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let now = jwt::now();
+    let expires_at = now.saturating_add(ttl_s);
+    let mut selected: Vec<(String, String, String)> = Vec::new();
+    let mut matched_targets = vec![false; targets.len()];
+    {
+        let state = ctx.state.lock().await;
+        for agent in &agents {
+            let Some(pane) = agent.get("pane_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if pane == pane_id || !state.owns_pane(pane, &identity.sub) {
+                continue;
+            }
+            let name = agent
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(pane)
+                .to_string();
+            let status = agent
+                .get("agent_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let matches = targets.is_empty()
+                || targets.iter().enumerate().any(|(index, target)| {
+                    let hit = target == pane || target == &name;
+                    if hit {
+                        matched_targets[index] = true;
+                    }
+                    hit
+                });
+            if matches {
+                selected.push((pane.to_string(), name, status));
+            }
+        }
+    }
+    if let Some(index) = matched_targets.iter().position(|matched| !matched) {
+        return Err((
+            "unknown_target".to_string(),
+            format!("watch target `{}` is not an owned agent", targets[index]),
+        ));
+    }
+    if selected.is_empty() {
+        return Err((
+            "invalid_param".to_string(),
+            "no owned agents match the watch".to_string(),
+        ));
+    }
+
+    let watch_id = format!("watch-{}", jwt::random_id());
+    let mut initial = std::collections::BTreeMap::new();
+    let mut watching = Vec::new();
+    for (pane, name, status) in &selected {
+        initial.insert(pane.clone(), status.clone());
+        watching.push(json!({
+            "target": name,
+            "pane_id": pane,
+            "agent_status": status,
+        }));
+    }
+    ctx.watches.insert(Watch {
+        watch_id: watch_id.clone(),
+        sub: identity.sub.clone(),
+        jti: identity.jti.clone(),
+        pane_id,
+        targets: selected.iter().map(|(pane, _, _)| pane.clone()).collect(),
+        until: until.clone(),
+        initial,
+        changes: Vec::new(),
+        last_prompt: None,
+        created_at: now,
+        expires_at,
+    });
+    Ok(json!({
+        "watch_id": watch_id,
+        "watching": watching,
+        "until": until,
+        "expires_at": expires_at,
+    }))
+}
+
+fn watch_end(
+    ctx: &Arc<Ctx>,
+    identity: &Identity,
+    params: &Value,
+) -> Result<Value, (String, String)> {
+    let watch_id = require_str(params, "watch_id")?;
+    Ok(json!({ "cancelled": ctx.watches.remove(&identity.sub, watch_id) }))
+}
+
+fn watch_drain(ctx: &Arc<Ctx>, identity: &Identity) -> Result<Value, (String, String)> {
+    let watches: Vec<Value> = ctx
+        .watches
+        .take_fired(&identity.sub)
+        .into_iter()
+        .map(|watch| {
+            json!({
+                "watch_id": watch.watch_id,
+                "changes": watch.changes,
+            })
+        })
+        .collect();
+    Ok(json!({ "watches": watches }))
+}
+
 fn require_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, (String, String)> {
     params
         .get(key)
@@ -1752,13 +2041,16 @@ async fn message_poll(
 ) -> Result<Value, (String, String)> {
     let caller = caller_principal(ctx, identity).await?;
     let requested_wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
-    let capped = ctx.cfg.message_poll_max_ms > 0 && requested_wait_ms > ctx.cfg.message_poll_max_ms;
-    let wait_ms = if ctx.cfg.message_poll_max_ms == 0 {
-        requested_wait_ms
-    } else {
-        requested_wait_ms.min(ctx.cfg.message_poll_max_ms)
-    };
+    let (wait_ms, capped) = ctx.cfg.clamp_wait_ms(identity.role, requested_wait_ms);
     let infinite = wait_ms == 0;
+    let wait_id = ctx.waits.begin_if_absent(
+        &identity.sub,
+        &identity.jti,
+        identity.pane_id.as_deref(),
+        "message-poll",
+        crate::waits::wait_ttl_s(wait_ms),
+    );
+    let _wait_guard = WaitGuard::new(ctx.waits.clone(), &identity.jti, wait_id);
     let limit = params
         .get("limit")
         .and_then(Value::as_u64)
@@ -1828,7 +2120,12 @@ async fn message_poll(
             changed = rx.changed() => {
                 if changed.is_err() {
                     let waited_ms = start.elapsed().as_millis() as u64;
-                    return Ok(json!({ "messages": [], "has_more": false, "waited_ms": waited_ms }));
+                    return Ok(json!({
+                        "messages": [],
+                        "has_more": false,
+                        "waited_ms": waited_ms,
+                        "capped": capped,
+                    }));
                 }
             }
         }
@@ -1842,11 +2139,9 @@ async fn message_notify(
 ) -> Result<Value, (String, String)> {
     let caller = caller_principal(ctx, identity).await?;
     let requested_wait_ms = params.get("wait_ms").and_then(Value::as_u64).unwrap_or(0);
-    let wait_ms = if ctx.cfg.message_poll_max_ms == 0 {
-        requested_wait_ms
-    } else {
-        requested_wait_ms.min(ctx.cfg.message_poll_max_ms)
-    };
+    // Notify is the always-running MCP notifier, so it is clamped but never
+    // recorded as a wait (that would mark every agent as waiting forever).
+    let (wait_ms, capped) = ctx.cfg.clamp_wait_ms(identity.role, requested_wait_ms);
     let infinite = wait_ms == 0;
     let start = tokio::time::Instant::now();
     let deadline = if infinite {
@@ -1872,6 +2167,7 @@ async fn message_notify(
                     "created_at": message.created_at,
                     "preview": preview(&message.body),
                 })).collect::<Vec<_>>(),
+                "capped": capped,
             }));
         }
         let remaining = match deadline {
@@ -1879,16 +2175,26 @@ async fn message_notify(
             None => Duration::from_secs(3600),
         };
         if !infinite && remaining.is_zero() {
-            return Ok(json!({ "pending": 0, "messages": [], "timed_out": true }));
+            return Ok(json!({
+                "pending": 0,
+                "messages": [],
+                "timed_out": true,
+                "capped": capped,
+            }));
         }
         tokio::select! {
             _ = tokio::time::sleep(remaining) => {
                 if infinite { continue; }
-                return Ok(json!({ "pending": 0, "messages": [], "timed_out": true }));
+                return Ok(json!({
+                    "pending": 0,
+                    "messages": [],
+                    "timed_out": true,
+                    "capped": capped,
+                }));
             }
             changed = rx.changed() => {
                 if changed.is_err() {
-                    return Ok(json!({ "pending": 0, "messages": [] }));
+                    return Ok(json!({ "pending": 0, "messages": [], "capped": capped }));
                 }
             }
         }
@@ -2057,6 +2363,12 @@ fn message_json(message: &Message) -> Value {
 const WAKEUP_PROMPT: &str =
     "[herdr-auth] unread messages are waiting. Call the message-poll tool now.";
 
+/// Fixed proxy-generated wake-up for a fired lifecycle watch. It deliberately
+/// contains no target-derived text, so a child cannot inject instructions into
+/// its parent's prompt.
+const WATCH_PROMPT: &str =
+    "[herdr-auth] a watched child changed lifecycle state. Call the poll tool now.";
+
 /// Stage 2 fallback: prompt an idle agent if it did not poll after the
 /// notification. Only a fixed proxy-generated string is ever sent.
 fn spawn_wakeup(ctx: Arc<Ctx>, target: Principal, message_id: String, message_created_at: u64) {
@@ -2125,9 +2437,124 @@ async fn agent_status(ctx: &Arc<Ctx>, pane: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Background monitor for `auth.watch.begin`. It never blocks an agent: it
+/// observes owned children and, once a watch fires, prompts the (idle) waiter
+/// with a fixed string. Changes stay queued until the waiter drains them with
+/// `poll`.
+fn spawn_watch_monitor(ctx: Arc<Ctx>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            watch_tick(&ctx).await;
+        }
+    });
+}
+
+async fn watch_tick(ctx: &Arc<Ctx>) {
+    if ctx.watches.is_empty() {
+        return;
+    }
+    let now = jwt::now();
+    let watches = ctx.watches.list(now);
+    if watches.is_empty() {
+        return;
+    }
+    let Ok(result) = upstream::request(
+        &ctx.paths.upstream_socket,
+        "agent.list",
+        json!({}),
+        "watch-monitor",
+    )
+    .await
+    else {
+        return;
+    };
+    let agents = result
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for watch in watches {
+        let mut statuses = std::collections::BTreeMap::new();
+        let mut names = std::collections::BTreeMap::new();
+        for agent in &agents {
+            let Some(pane) = agent.get("pane_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !watch.targets.iter().any(|target| target == pane) {
+                continue;
+            }
+            let name = agent
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(pane)
+                .to_string();
+            let status = agent
+                .get("agent_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            names.insert(pane.to_string(), name);
+            statuses.insert(pane.to_string(), status);
+        }
+        // A watched pane that disappeared counts as killed.
+        for target in &watch.targets {
+            statuses
+                .entry(target.clone())
+                .or_insert_with(|| "killed".to_string());
+        }
+        let mut changes = Vec::new();
+        for (pane, status) in &statuses {
+            let previous = watch
+                .initial
+                .get(pane)
+                .map(String::as_str)
+                .unwrap_or("__absent__");
+            if previous == status {
+                continue;
+            }
+            let triggers = watch.until.is_empty()
+                || watch.until.iter().any(|until| until == status)
+                || status == "killed";
+            if triggers {
+                changes.push(json!({
+                    "target": names.get(pane).unwrap_or(pane),
+                    "pane_id": pane,
+                    "from": previous,
+                    "to": status,
+                }));
+            }
+        }
+        ctx.watches.record(&watch.watch_id, changes, statuses);
+        if !ctx.watches.has_pending(&watch.watch_id) {
+            continue;
+        }
+        // Throttle wake-ups and only prompt a genuinely idle agent.
+        let throttled = watch
+            .last_prompt
+            .is_some_and(|last| now.saturating_sub(last) < ctx.cfg.message_wakeup_min_interval_s);
+        if throttled || agent_status(ctx, &watch.pane_id).await.as_deref() != Some("idle") {
+            continue;
+        }
+        if upstream::request(
+            &ctx.paths.upstream_socket,
+            "agent.prompt",
+            json!({ "target": watch.pane_id, "text": WATCH_PROMPT }),
+            "watch-wakeup",
+        )
+        .await
+        .is_ok()
+        {
+            ctx.watches.mark_prompt(&watch.watch_id, now);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type RecordedCalls = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
     fn test_identity(cwd: Option<String>) -> Identity {
         Identity {
@@ -2179,7 +2606,62 @@ mod tests {
             state: Mutex::new(State::default()),
             store: crate::store::Store::in_memory().await.unwrap(),
             mail: Arc::new(MailHub::new()),
+            waits: Arc::new(WaitHub::new()),
+            watches: Arc::new(WatchHub::new()),
             bootstrap_jti: "bootstrap-jti".into(),
+        })
+    }
+
+    /// Serve the responses in order, one connection per request, and record
+    /// every `(method, params)` pair.
+    fn serve_sequence(
+        socket: &std::path::Path,
+        responses: Vec<Value>,
+    ) -> (RecordedCalls, std::thread::JoinHandle<()>) {
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let socket = socket.to_path_buf();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let thread_calls = calls.clone();
+        let handle = std::thread::spawn(move || {
+            for result in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap_or(json!({}));
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let params = request.get("params").cloned().unwrap_or(json!({}));
+                thread_calls.lock().unwrap().push((method, params));
+                let _ = writeln!(stream, "{}", json!({"id": id, "result": result}));
+            }
+            let _ = std::fs::remove_file(socket);
+        });
+        (calls, handle)
+    }
+
+    /// Serve exactly one request on `socket` with `result`, then remove it.
+    fn serve_once(socket: &std::path::Path, result: Value) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let socket = socket.to_path_buf();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+                let request: Value = serde_json::from_str(line.trim()).unwrap_or(json!({}));
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let _ = writeln!(stream, "{}", json!({"id": id, "result": result}));
+            }
+            let _ = std::fs::remove_file(socket);
         })
     }
 
@@ -2871,5 +3353,171 @@ mod tests {
         let response: Value = serde_json::from_str(&dispatch(&ctx, &identity, &request).await)
             .expect("valid response");
         assert_eq!(response["error"]["code"], json!("upstream_error"));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_wait_params_are_clamped() {
+        let ctx = test_ctx().await;
+        let mut params = json!({"target": "w1:p1"});
+        clamp_wait_params(&ctx, &orchestrator_identity(), &mut params);
+        assert_eq!(params["timeout_ms"], json!(30_000));
+
+        let mut params = json!({"timeout_ms": 900_000});
+        clamp_wait_params(&ctx, &orchestrator_identity(), &mut params);
+        assert_eq!(params["timeout_ms"], json!(30_000));
+
+        let mut params = json!({"timeout_ms": 5_000});
+        clamp_wait_params(&ctx, &orchestrator_identity(), &mut params);
+        assert_eq!(params["timeout_ms"], json!(5_000));
+
+        // Agents may wait indefinitely: the cap is zero, so nothing is added.
+        let mut params = json!({});
+        clamp_wait_params(&ctx, &agent_identity("w1:p1"), &mut params);
+        assert!(params.get("timeout_ms").is_none());
+    }
+
+    #[tokio::test]
+    async fn waits_are_visible_only_for_owned_panes() {
+        let ctx = test_ctx().await;
+        let agent = agent_identity("w1:p2");
+        ctx.waits.begin(
+            &agent.sub,
+            &agent.jti,
+            Some("w1:p2"),
+            "message-poll",
+            crate::waits::wait_ttl_s(60_000),
+        );
+
+        let result = agent_waits(&ctx, &orchestrator_identity(), &json!({}))
+            .await
+            .unwrap();
+        assert!(result["waits"].as_array().unwrap().is_empty());
+
+        {
+            let mut state = ctx.state.lock().await;
+            state.record_pane("w1:p2", "orch", Some("agent-jti"), None);
+        }
+        let result = agent_waits(&ctx, &orchestrator_identity(), &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(result["waits"].as_array().unwrap().len(), 1);
+
+        // The caller's own wait is hidden unless explicitly requested.
+        let result = agent_waits(&ctx, &agent, &json!({})).await.unwrap();
+        assert!(result["waits"].as_array().unwrap().is_empty());
+        let result = agent_waits(&ctx, &agent, &json!({"include_self": true}))
+            .await
+            .unwrap();
+        assert_eq!(result["waits"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_begin_reports_the_role_cap() {
+        let ctx = test_ctx().await;
+        let result = wait_begin(
+            &ctx,
+            &orchestrator_identity(),
+            &json!({"kind": "poll", "wait_ms": 0}),
+        )
+        .unwrap();
+        assert_eq!(result["wait_ms"], json!(30_000));
+        assert_eq!(result["capped"], json!(true));
+
+        let result = wait_begin(
+            &ctx,
+            &agent_identity("w1:p1"),
+            &json!({"kind": "message-poll", "wait_ms": 0}),
+        )
+        .unwrap();
+        assert_eq!(result["wait_ms"], json!(0));
+        assert_eq!(result["capped"], json!(false));
+
+        let (code, _) =
+            wait_begin(&ctx, &agent_identity("w1:p1"), &json!({"kind": "bogus"})).unwrap_err();
+        assert_eq!(code, "invalid_param");
+    }
+
+    #[tokio::test]
+    async fn agents_cannot_watch_other_agents() {
+        let ctx = test_ctx().await;
+        let (code, _) = watch_begin(
+            &ctx,
+            &agent_identity("w1:p1"),
+            &json!({"targets": ["w1:p2"]}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, "forbidden");
+    }
+
+    #[tokio::test]
+    async fn watch_begin_selects_only_owned_children() {
+        let dir = std::env::temp_dir().join(format!("hap-watch-{}", jwt::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("herdr.sock");
+        let handle = serve_once(
+            &socket,
+            json!({"agents": [
+                {"name": "worker", "pane_id": "w1:p2", "agent_status": "working"},
+                {"name": "stranger", "pane_id": "w1:p3", "agent_status": "idle"}
+            ]}),
+        );
+        let ctx = test_ctx_at(dir).await;
+        {
+            let mut state = ctx.state.lock().await;
+            state.record_pane("w1:p2", "orch", Some("agent-jti"), None);
+        }
+        let mut identity = orchestrator_identity();
+        identity.pane_id = Some("w1:p1".into());
+        let result = watch_begin(&ctx, &identity, &json!({})).await.unwrap();
+        assert_eq!(result["watching"].as_array().unwrap().len(), 1);
+        assert_eq!(result["watching"][0]["target"], json!("worker"));
+        assert_eq!(result["watching"][0]["agent_status"], json!("working"));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_tick_records_change_and_prompts_idle_waiter() {
+        let dir = std::env::temp_dir().join(format!("hap-tick-{}", jwt::random_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("herdr.sock");
+        let (calls, handle) = serve_sequence(
+            &socket,
+            vec![
+                json!({"agents": [
+                    {"name": "worker", "pane_id": "w1:p2", "agent_status": "idle"}
+                ]}),
+                json!({"agent": {"agent_status": "idle"}}),
+                json!({}),
+            ],
+        );
+        let ctx = test_ctx_at(dir).await;
+        let now = jwt::now();
+        ctx.watches.insert(Watch {
+            watch_id: "watch-1".into(),
+            sub: "orch".into(),
+            jti: "orch-jti".into(),
+            pane_id: "w1:p1".into(),
+            targets: vec!["w1:p2".into()],
+            until: Vec::new(),
+            initial: std::collections::BTreeMap::from([(
+                "w1:p2".to_string(),
+                "working".to_string(),
+            )]),
+            changes: Vec::new(),
+            last_prompt: None,
+            created_at: now,
+            expires_at: now + 60,
+        });
+
+        watch_tick(&ctx).await;
+        handle.join().unwrap();
+
+        assert!(ctx.watches.has_pending("watch-1"));
+        let calls = calls.lock().unwrap();
+        let methods: Vec<&str> = calls.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(methods, vec!["agent.list", "agent.get", "agent.prompt"]);
+        assert_eq!(calls[2].1["target"], json!("w1:p1"));
+        assert_eq!(calls[2].1["text"], json!(WATCH_PROMPT));
     }
 }
