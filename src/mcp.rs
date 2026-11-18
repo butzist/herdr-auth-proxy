@@ -478,9 +478,46 @@ fn drain_watches(options: &Options) -> Vec<Value> {
                 .filter_map(|watch| watch.get("changes").and_then(Value::as_array))
                 .flatten()
                 .cloned()
+                .map(|mut change| {
+                    if let Some(object) = change.as_object_mut() {
+                        object.entry("source").or_insert_with(|| json!("watch"));
+                    }
+                    change
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Collapse changes that describe the same transition. A transition can be
+/// observed twice in one `poll`: once by `auth.watch.*` and once by the poll's
+/// own status diff. Records carry `source` (`watch` / `poll`) for diagnostics;
+/// the first record wins, and it is the richer watch record when both exist.
+fn dedupe_changes(changes: Vec<Value>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    changes
+        .into_iter()
+        .filter(|change| {
+            let key = (
+                change
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                change
+                    .get("from")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                change
+                    .get("to")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            seen.insert(key)
+        })
+        .collect()
 }
 
 fn decorate_agent_waits(options: &Options, method: &str, result: &mut Value) {
@@ -662,7 +699,7 @@ fn run_poll_inner(options: &Options, arguments: &Value, wait_ms: u64) -> Value {
             "timed_out": false,
             "waited_ms": 0,
             "messages": [],
-            "changes": watch_changes,
+            "changes": dedupe_changes(watch_changes),
             "statuses": initial,
             "waiting": waiting_json(options, &names),
         }));
@@ -704,7 +741,7 @@ fn run_poll_inner(options: &Options, arguments: &Value, wait_ms: u64) -> Value {
                         "waited_ms": waited,
                         "messages": msgs,
                         "claim_id": result.get("claim_id"),
-                        "changes": changes,
+                        "changes": dedupe_changes(changes),
                     });
                     // statuses
                     if let Ok((_, statuses, names)) = fetch(options, &targets_filter) {
@@ -750,9 +787,15 @@ fn run_poll_inner(options: &Options, arguments: &Value, wait_ms: u64) -> Value {
             if old != new
                 && (until.is_empty() || until.contains(&new.to_string()) || new == "killed")
             {
-                changes.push(json!({"target": key, "from": old, "to": new}));
+                changes.push(json!({
+                    "target": key,
+                    "from": old,
+                    "to": new,
+                    "source": "poll",
+                }));
             }
         }
+        let changes = dedupe_changes(changes);
         if !changes.is_empty() {
             let waited = start.elapsed().as_millis() as u64;
             let out = json!({
@@ -772,6 +815,7 @@ fn run_poll_inner(options: &Options, arguments: &Value, wait_ms: u64) -> Value {
             let waited = start.elapsed().as_millis() as u64;
             let mut changes = std::mem::take(&mut watch_changes);
             changes.extend(drain_watches(options));
+            let changes = dedupe_changes(changes);
             let timed_out = changes.is_empty();
             let out = json!({
                 "timed_out": timed_out,
@@ -925,7 +969,7 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "poll",
-            "Collect messages, fired watch changes, and owned child status changes. wait_ms=0 waits up to your role cap (or indefinitely for agents). Orchestrators should prefer `watch` + a short `poll`.",
+            "Collect messages, fired watch changes, and owned child status changes. wait_ms=0 waits up to your role cap (or indefinitely for agents). Orchestrators should prefer `watch` + a short `poll`. `changes` are deduped and carry `source` (`watch` or `poll`).",
             json!({
                 "type": "object",
                 "properties": {
@@ -944,7 +988,7 @@ fn tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "targets": {"type": "array", "items": {"type": "string"}, "description": "Agent names/pane ids; default all owned children"},
-                    "until": {"type": "array", "items": {"type": "string"}, "description": "Only trigger on these statuses (idle, done, blocked, unknown, killed)"},
+                    "until": {"type": "array", "items": {"type": "string"}, "description": "Only trigger on these statuses (idle, working, done, blocked, unknown, killed)"},
                     "ttl_s": {"type": "integer", "description": "Watch lifetime in seconds (default 600, max 3600)"}
                 }
             }),
@@ -1167,6 +1211,38 @@ mod tests {
                 .unwrap()
                 .contains("peer-grant")
         );
+    }
+
+    #[test]
+    fn watch_and_poll_duplicate_changes_collapse() {
+        let changes = dedupe_changes(vec![
+            json!({
+                "target": "dev-2", "pane_id": "w1:p2",
+                "from": "working", "to": "done", "source": "watch"
+            }),
+            json!({
+                "target": "dev-2", "from": "working", "to": "done",
+                "source": "poll"
+            }),
+            json!({
+                "target": "dev-2", "from": "working", "to": "blocked",
+                "source": "poll"
+            }),
+        ]);
+        assert_eq!(changes.len(), 2);
+        // The first (watch) record wins and keeps its richer payload.
+        assert_eq!(changes[0]["source"], json!("watch"));
+        assert_eq!(changes[0]["pane_id"], json!("w1:p2"));
+        assert_eq!(changes[1]["to"], json!("blocked"));
+    }
+
+    #[test]
+    fn distinct_transitions_are_not_deduped() {
+        let changes = dedupe_changes(vec![
+            json!({"target": "dev-2", "from": "idle", "to": "working", "source": "poll"}),
+            json!({"target": "dev-2", "from": "working", "to": "done", "source": "poll"}),
+        ]);
+        assert_eq!(changes.len(), 2);
     }
 
     /// Minimal blocking proxy for the client-side `poll` / `message-poll`

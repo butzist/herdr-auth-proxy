@@ -252,9 +252,10 @@ Blocking waits are role-capped: orchestrators default to 30 s
 (`orchestrator_max_wait_ms`), while agent tokens may wait indefinitely
 (`agent_max_wait_ms = 0`). Orchestrators should use `watch` instead of parking:
 it returns immediately and the proxy wakes the idle orchestrator when a watched
-child changes state; the next `poll` returns the queued `changes`. `poll`,
-`agent-list`, and `agent-get` include a `waiting` field so a parked agent is not
-mistaken for a busy one. herdr's own lifecycle is never rewritten.
+child changes state; the next `poll` returns the queued `changes` (deduped, with
+a `source` of `watch` or `poll`). `poll`, `agent-list`, and `agent-get` include
+a `waiting` field so a parked agent is not mistaken for a busy one. herdr's own
+lifecycle is never rewritten.
 
 Start/stop together with the herdr server (no systemd unit):
 

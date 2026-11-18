@@ -487,7 +487,7 @@ NDJSON codec:
 | `auth.message.peer.grant` / `revoke` / `list` | direct, non-transitive, revocable sibling links between a parent's own children |
 | `auth.wait.begin` / `end` | record a blocking wait (kind: `poll`, `message-poll`, `watch`) so it is visible as `waiting`; the proxy returns the role-capped duration |
 | `auth.agent.waits` | list waits for the caller and its owned panes |
-| `auth.watch.begin` / `end` / `drain` | non-blocking lifecycle watch on owned children; the proxy prompts the (idle) waiter and queues the change for `poll` |
+| `auth.watch.begin` / `end` / `drain` | non-blocking lifecycle watch on owned children; the proxy prompts the (idle) waiter and queues the change for `poll`. The MCP `poll` tags drained changes `source: "watch"`, its own status diff `source: "poll"`, and dedupes them by `(target, from, to)` |
 
 `auth.agent.spawn` params: `kind`, `args`, optional `name`, `label`, `focus`,
 `ttl_s`, `grants` (agent tokens never carry `perm`, so it is rejected). The

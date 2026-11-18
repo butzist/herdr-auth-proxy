@@ -52,8 +52,27 @@ integration tests against a real herdr.
       `auth.wait.begin/end`, `auth.agent.waits`, the `waiting` field on
       `poll`/`agent-list`/`agent-get`, and non-blocking `auth.watch.*`
       (`watch` MCP tool) with an idle-only fixed wake-up prompt.
-- [ ] Live-validate the `watch` wake-up path with a real opencode MCP client
-      (prompt delivery while idle, `poll` drains recorded changes).
+- [x] Live-validate the `watch` wake-up path with a real opencode MCP client:
+      the fixed prompt is delivered while the orchestrator is idle, the next
+      `poll` drains the recorded change, and the fired watch is consumed (a
+      later `watch-cancel` returns `cancelled: false`). Confirmed limits: watch
+      is lifecycle-only (a child parked in `message-poll` stays `working`, so a
+      report is a message, not a watch change), and `done` is not wakeable by
+      the stage-2 message fallback.
+- [x] **Fixed:** deduplicate `changes` returned by `poll`. A transition seen by
+      both `auth.watch.*` and the poll's own status diff was reported twice
+      (only when the transition landed during a running poll). `changes` now
+      carry `source: "watch" | "poll"` and are deduped by
+      `(target, from, to)`, keeping the richer watch record.
+- [ ] **Tech debt:** decide whether a `done` worker can be woken. The message
+      fallback only prompts `idle`, so a worker that ends its turn is stranded
+      until the orchestrator kills/respawns it. Live-test `agent.prompt` on a
+      `done` pane; then either prompt `done` too (and report it as delivered)
+      or make the PM wording explicit that `done` is terminal.
+- [x] Verified that the orchestrator cap applies to `poll`, `message-poll` and
+      `agent.wait` (30 s by default): `wait_ms: 0` returns at the cap with
+      `timed_out: true`. This is intended; keep client/agent wording sized to
+      the cap instead of claiming an unbounded orchestrator poll.
 - [ ] Bound server-side infinite waits to the token lifetime (or detect peer
       disconnect) so a dead client cannot leave a poll task running forever.
 
